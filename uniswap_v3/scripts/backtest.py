@@ -25,14 +25,14 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from uniswap_v3.math import (
-    get_sqrt_ratio_at_tick,
-    round_tick_to_spacing,
+    tick_to_sqrt,
+    snap_tick,
     price_to_tick,
     tick_to_price,
-    get_liquidity_for_amounts,
-    get_amounts_for_liquidity,
-    calculate_fee_growth_delta,
-    optimal_token_split,
+    amounts_to_L,
+    L_to_amounts,
+    fee_delta,
+    split_tokens,
 )
 from uniswap_v3.constants import Q128, TICK_SPACINGS
 
@@ -124,24 +124,24 @@ def run_backtest_with_timeseries(
     Pa = P0 * (1 - range_pct)
     Pb = P0 * (1 + range_pct)
 
-    tick_lower = round_tick_to_spacing(
+    tick_lower = snap_tick(
         price_to_tick(Pb, token0_decimals, token1_decimals), tick_spacing
     )
-    tick_upper = round_tick_to_spacing(
+    tick_upper = snap_tick(
         price_to_tick(Pa, token0_decimals, token1_decimals), tick_spacing
     )
     if tick_lower > tick_upper:
         tick_lower, tick_upper = tick_upper, tick_lower
 
-    sqrt_price_lower = get_sqrt_ratio_at_tick(tick_lower)
-    sqrt_price_upper = get_sqrt_ratio_at_tick(tick_upper)
-    sqrt_price_initial = get_sqrt_ratio_at_tick(start_tick)
+    sqrt_price_lower = tick_to_sqrt(tick_lower)
+    sqrt_price_upper = tick_to_sqrt(tick_upper)
+    sqrt_price_initial = tick_to_sqrt(start_tick)
 
-    x_human, y_human = optimal_token_split(investment_usd, P0, Pa, Pb)
+    x_human, y_human = split_tokens(investment_usd, P0, Pa, Pb)
     x_amount = int(x_human * (10 ** token0_decimals))
     y_amount = int(y_human * (10 ** token1_decimals))
 
-    L = get_liquidity_for_amounts(
+    L = amounts_to_L(
         sqrt_price_initial, sqrt_price_lower, sqrt_price_upper,
         x_amount, y_amount
     )
@@ -178,8 +178,8 @@ def run_backtest_with_timeseries(
             curr_fg0 = int(row['fee_growth_global_0_x128'])
             curr_fg1 = int(row['fee_growth_global_1_x128'])
 
-            delta_fg0 = calculate_fee_growth_delta(curr_fg0, prev_fg0)
-            delta_fg1 = calculate_fee_growth_delta(curr_fg1, prev_fg1)
+            delta_fg0 = fee_delta(curr_fg0, prev_fg0)
+            delta_fg1 = fee_delta(curr_fg1, prev_fg1)
 
             fee0_raw = (L * delta_fg0) // Q128
             fee1_raw = (L * delta_fg1) // Q128
@@ -198,8 +198,8 @@ def run_backtest_with_timeseries(
         prev_fg1 = int(row['fee_growth_global_1_x128'])
 
         # 시계열 데이터 수집
-        sqrt_price_current = get_sqrt_ratio_at_tick(current_tick)
-        amt0, amt1 = get_amounts_for_liquidity(
+        sqrt_price_current = tick_to_sqrt(current_tick)
+        amt0, amt1 = L_to_amounts(
             sqrt_price_current, sqrt_price_lower, sqrt_price_upper, L
         )
         if invert_price:
@@ -208,7 +208,7 @@ def run_backtest_with_timeseries(
         else:
             lp_val = (amt0 / 10**token0_decimals) * current_price + (amt1 / 10**token1_decimals)
             hodl_val = (hodl_token0 / 10**token0_decimals) * current_price + (hodl_token1 / 10**token1_decimals)
-        il_pct = ((lp_val - hodl_val) / hodl_val * 100) if hodl_val > 0 else 0
+        il_pct = (lp_val - hodl_val) / hodl_val * 100 if hodl_val > 0 else 0
 
         timestamps.append(row['timestamp'])
         prices.append(current_price)
@@ -217,8 +217,8 @@ def run_backtest_with_timeseries(
         cumulative_fees.append(total_fees_usd)
         il_pcts.append(il_pct)
 
-    sqrt_price_final = get_sqrt_ratio_at_tick(end_tick)
-    amt0, amt1 = get_amounts_for_liquidity(
+    sqrt_price_final = tick_to_sqrt(end_tick)
+    amt0, amt1 = L_to_amounts(
         sqrt_price_final, sqrt_price_lower, sqrt_price_upper, L
     )
 
@@ -230,7 +230,7 @@ def run_backtest_with_timeseries(
         final_hodl_value = (hodl_token0 / 10**token0_decimals) * P1 + (hodl_token1 / 10**token1_decimals)
 
     il_usd = final_lp_value - final_hodl_value
-    il_pct_final = (il_usd / final_hodl_value) * 100 if final_hodl_value > 0 else 0
+    il_pct_final = (final_lp_value - final_hodl_value) / final_hodl_value * 100 if final_hodl_value > 0 else 0
 
     net_pnl_usd = (final_lp_value + total_fees_usd) - investment_usd
     net_pnl_pct = (net_pnl_usd / investment_usd) * 100
@@ -289,6 +289,19 @@ def create_detailed_chart(results: List[Dict], output_path: str = None, pool_nam
     ax1.set_title('Price with LP Ranges', fontweight='bold')
     ax1.legend(loc='upper left', fontsize=8)
     ax1.grid(alpha=0.3)
+
+    # 시작/종료 가격 및 LP 범위 표시
+    ax1.axhline(y=P0, color='green', linestyle='--', lw=0.8, alpha=0.7)
+    ax1.axhline(y=P1, color='red', linestyle='--', lw=0.8, alpha=0.7)
+    ax1.text(timestamps[0], P0, f' Start: ${P0:,.0f}', va='bottom', ha='left', fontsize=8, color='green')
+    ax1.text(timestamps[-1], P1, f'End: ${P1:,.0f} ', va='bottom', ha='right', fontsize=8, color='red')
+
+    # LP 범위 경계 표시 (첫 번째 전략 기준)
+    r0 = results[0]
+    price_lower = r0['price_lower'] if isinstance(r0['price_lower'], (int, float)) else r0['price_lower'][0]
+    price_upper = r0['price_upper'] if isinstance(r0['price_upper'], (int, float)) else r0['price_upper'][0]
+    ax1.text(timestamps[0], price_upper, f' Upper: ${price_upper:,.0f}', va='bottom', ha='left', fontsize=7, color='blue', alpha=0.8)
+    ax1.text(timestamps[0], price_lower, f' Lower: ${price_lower:,.0f}', va='top', ha='left', fontsize=7, color='blue', alpha=0.8)
 
     # 2. LP + Fees vs HODL
     ax2 = axes[0, 1]
@@ -403,26 +416,26 @@ def run_backtest(
     Pb = P0 * (1 + range_pct)
 
     # 틱으로 변환
-    tick_lower = round_tick_to_spacing(
+    tick_lower = snap_tick(
         price_to_tick(Pb, token0_decimals, token1_decimals), tick_spacing
     )
-    tick_upper = round_tick_to_spacing(
+    tick_upper = snap_tick(
         price_to_tick(Pa, token0_decimals, token1_decimals), tick_spacing
     )
     if tick_lower > tick_upper:
         tick_lower, tick_upper = tick_upper, tick_lower
 
-    sqrt_price_lower = get_sqrt_ratio_at_tick(tick_lower)
-    sqrt_price_upper = get_sqrt_ratio_at_tick(tick_upper)
-    sqrt_price_initial = get_sqrt_ratio_at_tick(start_tick)
+    sqrt_price_lower = tick_to_sqrt(tick_lower)
+    sqrt_price_upper = tick_to_sqrt(tick_upper)
+    sqrt_price_initial = tick_to_sqrt(start_tick)
 
     # 최적 토큰 분할
-    x_human, y_human = optimal_token_split(investment_usd, P0, Pa, Pb)
+    x_human, y_human = split_tokens(investment_usd, P0, Pa, Pb)
     x_amount = int(x_human * (10 ** token0_decimals))
     y_amount = int(y_human * (10 ** token1_decimals))
 
     # 유동성 계산
-    L = get_liquidity_for_amounts(
+    L = amounts_to_L(
         sqrt_price_initial, sqrt_price_lower, sqrt_price_upper,
         x_amount, y_amount
     )
@@ -454,8 +467,8 @@ def run_backtest(
             curr_fg0 = int(row['fee_growth_global_0_x128'])
             curr_fg1 = int(row['fee_growth_global_1_x128'])
 
-            delta_fg0 = calculate_fee_growth_delta(curr_fg0, prev_fg0)
-            delta_fg1 = calculate_fee_growth_delta(curr_fg1, prev_fg1)
+            delta_fg0 = fee_delta(curr_fg0, prev_fg0)
+            delta_fg1 = fee_delta(curr_fg1, prev_fg1)
 
             fee0_raw = (L * delta_fg0) // Q128
             fee1_raw = (L * delta_fg1) // Q128
@@ -473,8 +486,8 @@ def run_backtest(
         prev_fg1 = int(row['fee_growth_global_1_x128'])
 
     # 최종 포지션 가치 계산
-    sqrt_price_final = get_sqrt_ratio_at_tick(end_tick)
-    amt0, amt1 = get_amounts_for_liquidity(
+    sqrt_price_final = tick_to_sqrt(end_tick)
+    amt0, amt1 = L_to_amounts(
         sqrt_price_final, sqrt_price_lower, sqrt_price_upper, L
     )
 
@@ -487,7 +500,7 @@ def run_backtest(
 
     # IL 계산
     il_usd = final_lp_value - final_hodl_value
-    il_pct = (il_usd / final_hodl_value) * 100 if final_hodl_value > 0 else 0
+    il_pct = (final_lp_value - final_hodl_value) / final_hodl_value * 100 if final_hodl_value > 0 else 0
 
     # 성과 지표
     net_pnl_usd = (final_lp_value + total_fees_usd) - investment_usd
