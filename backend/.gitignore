@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+
+# Logs
+*.log
+logs/archive/
+
+# Models & Checkpoints
+models/checkpoints/
+*.zip
+
+# Data
+data/training/*.parquet
+data/cache/
+
+# TensorBoard
+logs/tensorboard/*/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/

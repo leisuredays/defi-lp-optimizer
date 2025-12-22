@@ -7,6 +7,7 @@ import strategyRangesReducer from "./store/strategyRanges";
 import strategiesReducer from "./store/strategies";
 import windowReducer from "./store/window"
 import tokenRatiosReducer from "./store/tokenRatios";
+import predictionReducer from "./store/prediction";
 
 export const Store = configureStore({
     reducer: {
@@ -16,7 +17,8 @@ export const Store = configureStore({
       strategyRanges: strategyRangesReducer,
       strategies: strategiesReducer,
       window: windowReducer,
-      tokenRatios: tokenRatiosReducer
+      tokenRatios: tokenRatiosReducer,
+      prediction: predictionReducer
     },
     middleware: [thunk]
 });

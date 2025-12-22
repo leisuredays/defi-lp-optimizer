@@ -1,0 +1,64 @@
+# PPO Training Configuration for WETH/USDT 0.3% Pool
+# Model: Full Autonomy (no forced rebalancing, no cooldown)
+
+# Data Configuration
+data:
+  pool_file: "data/training/ethereum_weth_usdt_03_data.parquet"
+  train_split: 0.8
+  val_split: 0.1
+  # test_split is implicit: 0.1
+
+# Environment Configuration
+environment:
+  initial_investment: 10000
+  episode_length_hours: 672  # 28 days (fits in validation set)
+  reward_weights:
+    alpha: 1.0   # Fees coefficient (equal weight)
+    beta: 1.0    # IL coefficient (equal weight)
+    gamma: 1.0   # Gas coefficient (equal weight)
+
+# PPO Hyperparameters
+ppo:
+  learning_rate: 0.0003
+  n_steps: 2048
+  batch_size: 64
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  policy_kwargs:
+    net_arch:
+      - 256
+      - 256
+
+# Training Settings
+training:
+  total_timesteps: 5000000
+  checkpoint_freq: 100000
+  eval_freq: 50000
+  n_eval_episodes: 10
+
+# Hardware Configuration
+hardware:
+  device: "auto"  # "cuda", "cpu", or "auto"
+
+# Output Configuration
+output:
+  model_dir: "models"
+  model_name: "ppo_weth_usdt_03_full_autonomy"
+  checkpoint_dir: "models/checkpoints"
+  tensorboard_log: "logs/tensorboard"
+  eval_results_path: "results/training_stats.json"
+
+# Pool Configuration (WETH/USDT 0.3% on Ethereum)
+pool:
+  pool_id: "0x4e68ccd3e89f51c3074ca5072bbac773960dfa36"
+  protocol_id: 0  # Ethereum Mainnet
+  fee_tier: 3000  # 0.3%
+  token0_symbol: "WETH"
+  token1_symbol: "USDT"
+  token0_decimals: 18
+  token1_decimals: 6

@@ -100,7 +100,7 @@ export const getMaticMarketData = async () => {
 
  export const getGraphETHData = async () => {
 
-  const query = 
+  const query =
 
   `
     query {
@@ -108,18 +108,24 @@ export const getMaticMarketData = async () => {
       {
         id
         token0Price
-        
-      }    
+
+      }
     }
     `
 
   try {
-    const response = await fetch("https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v3", {
+    const apiKey = process.env.REACT_APP_GRAPH_API_KEY;
+    const subgraphId = '5zvR82QoaXYFyDEKLZ9t6v9adgnptxYpKpSbxtgVENFV'; // Ethereum Mainnet
+    const url = apiKey
+      ? `https://gateway.thegraph.com/api/${apiKey}/subgraphs/id/${subgraphId}`
+      : "https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v3"; // Fallback to deprecated endpoint
+
+    const response = await fetch(url, {
       method:'POST',
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ 
+      body: JSON.stringify({
         query: query,
         variables: {address: ["0x290a6a7460b308ee3f19023d2d00de604bcf5b42", "0x8ad599c3a0ff1de082011efddc58f1908eb6e6d8"]},
       })
@@ -140,7 +146,7 @@ export const getMaticMarketData = async () => {
 
  export const getGraphHistoricalPrices = async (signal) => {
 
-  const query = 
+  const query =
 
   `
     query {
@@ -151,20 +157,26 @@ export const getMaticMarketData = async () => {
           reserveUSD
           date
         }
-      }      
-      
+      }
+
     `
 
   try {
-    const response = await fetch("https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v2", {
+    const apiKey = process.env.REACT_APP_GRAPH_API_KEY;
+    const subgraphId = 'A3Np3RQbaBA6oKJgiwDJeo5T3zrYfGHPWFYayMwtNDum'; // Uniswap V2 Ethereum Mainnet
+    const url = apiKey
+      ? `https://gateway.thegraph.com/api/${apiKey}/subgraphs/id/${subgraphId}`
+      : "https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v2"; // Fallback to deprecated endpoint
+
+    const response = await fetch(url, {
       method:'POST',
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ 
+      body: JSON.stringify({
         query: query
       }),
-      signal: signal 
+      signal: signal
     });
 
     const data = await response.json();
@@ -174,7 +186,7 @@ export const getMaticMarketData = async () => {
       return data.data.pairDayDatas.map(d => {
         return {date: d.date, maticEth: d.reserve1 / d.reserve0, maticUSD: d.reserveUSD / 2 / d.reserve0}
       })
-      
+
     }
 
   } catch (error) {

@@ -1,0 +1,21 @@
+.loading-progress {
+  width: 100%;
+  padding: 10px;
+  background: rgba(0, 0, 0, 0.1);
+  border-radius: 4px;
+  margin-bottom: 10px;
+}
+
+.progress-bar {
+  height: 4px;
+  background: linear-gradient(90deg, #4CAF50, #8BC34A);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+.progress-text {
+  font-size: 11px;
+  color: #666;
+  margin-top: 4px;
+  display: block;
+}

@@ -13,6 +13,7 @@ import PoolOverview from '../layout/PoolOverview';
 import StrategyOverview from '../layout/StrategyOverview';
 import PoolPriceLiquidity from '../layout/PoolPriceLiquidity';
 import StrategyBacktest from '../layout/StrategyBacktest';
+import AIPrediction from '../layout/AIPrediction';
 
 // Components //
 import Grid from "../components/Grid"
@@ -100,7 +101,7 @@ useEffect(() => {
           >
         </NavBar>
         <Grid className={styles["dashboard-container"]}
-          rows={150} columns={62}
+          rows={200} columns={62}
           cellAspectRatio={0.82} gridGap={5}
           gridWidth={windowDim.width} minWidth={pageMinWidth}>
           <PoolOverview page="uniswap" pageStyle={styles}></PoolOverview>
@@ -111,6 +112,7 @@ useEffect(() => {
           }
           {/* <StrategyBacktest  page="uniswap" pageStyle={styles}></StrategyBacktest> */}
           <SideBar  page="uniswap" width={windowDim.width} minWidth={pageMinWidth} protocols={[0, 1, 2, 3, 5]} leverageHidden={true} pageStyle={styles}></SideBar>
+          <AIPrediction page="uniswap" pageStyle={styles}></AIPrediction>
           <UniswapLink></UniswapLink>
           <DashBoard page="uniswap" pageStyle={styles}></DashBoard>
         </Grid>

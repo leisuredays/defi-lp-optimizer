@@ -13,14 +13,15 @@ import {getPoolDayData} from '../api/thegraph/uniPoolDayDatas'
 
 
 const initialState = {
-id: "", 
-feeTier: 0, 
+id: "",
+feeTier: 0,
 name: "",
 price_base: "",
 price_quote: "",
 baseToken: {id: 0, symbol: "", name: "", decimals: "", currentPrice: ""},
 quoteToken: {id: 1, symbol: "", name: "", decimals: "", currentPrice: ""},
-loading: true, std: "", mean: "", normStd: "", liquidity: ""};
+loading: true, std: "", mean: "", normStd: "", liquidity: "",
+hourlyDataCache: null};
 
 const genDailyStats = (dailyPoolData) => {
 
@@ -86,6 +87,7 @@ export const fetchPoolData = pool => {
   return async (dispatch, getState) => {
 
     dispatch(setLoading(true));
+    dispatch(clearCachedHourlyData()); // Clear cache when switching pools
 
     const protocol = pool.protocol ? pool.protocol : getState().protocol.value.id;
     const ticks = await liquidityByPoolId(pool.id, null, protocol);
@@ -156,10 +158,21 @@ export const poolSlice = createSlice({
       const basePriceField = "token" + state.value.baseToken.id + "Price";
       const quotePriceField = "token" + state.value.quoteToken.id + "Price";
 
-      if (state.value.baseToken.currentPrice !== action.payload[basePriceField]) state.value.baseToken.currentPrice = action.payload[basePriceField]; 
-      if (state.value.quoteToken.currentPrice !== action.payload[quotePriceField]) state.value.quoteToken.currentPrice = action.payload[quotePriceField];   
-      
+      if (state.value.baseToken.currentPrice !== action.payload[basePriceField]) state.value.baseToken.currentPrice = action.payload[basePriceField];
+      if (state.value.quoteToken.currentPrice !== action.payload[quotePriceField]) state.value.quoteToken.currentPrice = action.payload[quotePriceField];
+
       state.value.loading = false;
+    },
+    setCachedHourlyData: (state, action) => {
+      state.value.hourlyDataCache = {
+        poolId: action.payload.poolId,
+        data: action.payload.data,
+        fetchedDays: action.payload.fetchedDays,
+        timestamp: Date.now()
+      };
+    },
+    clearCachedHourlyData: (state) => {
+      state.value.hourlyDataCache = null;
     }
   }
 });
@@ -190,5 +203,5 @@ export const selectYesterdaysPriceData = state => {
 }
 
 
-export const { setPool, refreshCurrentPrices, setLoading, setToggleBaseToken, setCurrentPrice } = poolSlice.actions;
+export const { setPool, refreshCurrentPrices, setLoading, setToggleBaseToken, setCurrentPrice, setCachedHourlyData, clearCachedHourlyData } = poolSlice.actions;
 export default poolSlice.reducer

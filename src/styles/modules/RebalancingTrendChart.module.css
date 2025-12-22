@@ -1,0 +1,234 @@
+.container {
+  background: #16213e;
+  border-radius: 8px;
+  padding: 16px;
+  margin-top: 16px;
+}
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #fff;
+  margin: 0;
+}
+
+.legend {
+  display: flex;
+  gap: 16px;
+  font-size: 11px;
+}
+
+.legendItem {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #a0a0a0;
+}
+
+/* Legend icons matching the chart */
+.priceLegendLine {
+  width: 20px;
+  height: 2px;
+  background: #fff;
+  border-radius: 1px;
+}
+
+.rangeLegendLine {
+  width: 20px;
+  height: 2px;
+  background: #ef4444;
+  border-radius: 1px;
+}
+
+.rebalanceLegendDot {
+  width: 10px;
+  height: 10px;
+  background: #3b82f6;
+  border-radius: 50%;
+  border: 2px solid #fff;
+}
+
+/* Chart elements */
+
+/* Price line - white smooth curve */
+.priceLine {
+  fill: none;
+  stroke: #fff;
+  stroke-width: 2px;
+}
+
+/* LP Range lines - red horizontal step lines */
+.minRangeLine {
+  fill: none;
+  stroke: #ef4444;
+  stroke-width: 2px;
+}
+
+.maxRangeLine {
+  fill: none;
+  stroke: #ef4444;
+  stroke-width: 2px;
+}
+
+/* Rebalancing events - blue vertical lines */
+.rebalanceLine {
+  stroke: #3b82f6;
+  stroke-width: 2px;
+  stroke-dasharray: 6 4;
+  opacity: 0.8;
+}
+
+.rebalanceMarker {
+  fill: #3b82f6;
+  stroke: #fff;
+  stroke-width: 2px;
+}
+
+/* Axis styling */
+.axis line,
+.axis path {
+  stroke: #3a4a6b;
+}
+
+.axis text {
+  fill: #a0a0a0;
+  font-size: 10px;
+}
+
+.axisLabel {
+  fill: #a0a0a0;
+  font-size: 11px;
+}
+
+/* Stats row */
+.stats {
+  display: flex;
+  justify-content: space-around;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.statItem {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.statLabel {
+  font-size: 11px;
+  color: #a0a0a0;
+}
+
+.statValue {
+  font-size: 14px;
+  font-weight: 600;
+  color: #fff;
+}
+
+.statValue.positive {
+  color: #10b981;
+}
+
+.statValue.negative {
+  color: #ef4444;
+}
+
+/* Formula section */
+.formula {
+  margin-top: 12px;
+  padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 4px;
+  text-align: center;
+}
+
+.formulaText {
+  font-size: 12px;
+  color: #a0a0a0;
+  font-family: 'Courier New', monospace;
+}
+
+/* Token Holdings section */
+.tokenHoldings {
+  margin-top: 12px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.tokenHeader {
+  font-size: 12px;
+  color: #a0a0a0;
+  margin-bottom: 8px;
+  font-weight: 500;
+}
+
+.tokenStats {
+  display: flex;
+  justify-content: space-around;
+  gap: 16px;
+}
+
+.tokenItem {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  flex: 1;
+}
+
+.tokenLabel {
+  font-size: 11px;
+  color: #a0a0a0;
+  font-weight: 500;
+}
+
+.tokenValue {
+  font-size: 13px;
+  font-weight: 600;
+  color: #fff;
+  font-family: 'Courier New', monospace;
+}
+
+.tokenValueUsd {
+  display: block;
+  font-size: 11px;
+  color: #10b981;
+  margin-top: 2px;
+  font-weight: 400;
+}
+
+.tokenValue.totalValue {
+  font-size: 15px;
+  color: #3b82f6;
+}
+
+.tokenValue.profitPositive {
+  color: #10b981;
+  font-weight: 700;
+}
+
+.tokenValue.profitNegative {
+  color: #ef4444;
+  font-weight: 700;
+}
+
+/* No data state */
+.noData {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 200px;
+  color: #666;
+  font-size: 14px;
+}

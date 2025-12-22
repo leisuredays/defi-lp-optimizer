@@ -24,3 +24,61 @@ yarn-debug.log*
 yarn-error.log*
 
 # temp while developing perpetual
+
+# Python virtual environments
+backend/venv/
+backend/.venv/
+venv/
+.venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Python distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Python environment files
+.python-version
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Local server logs
+logs/
+backend_server.log
+frontend_server.log
+
+# Serena local config
+.serena/
+
+# Trained models (large files)
+models/
+*.zip
+*.pt
+*.pth
+*.npz
+
+# Database files
+*.db

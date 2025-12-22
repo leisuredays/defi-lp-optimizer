@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useSelector } from 'react-redux';
+import { useSelector, useDispatch } from 'react-redux';
 import styles from '../styles/modules/StrategyBacktest.module.css'
 
 import { liquidityForStrategy, tokensForStrategy } from '../helpers/uniswap/liquidity';
@@ -7,18 +7,21 @@ import { maxInArray, parsePrice } from '../helpers/numbers';
 import { calcFees, pivotFeeData, backtestIndicators } from '../helpers/uniswap/backtest';
 
 import { getPoolHourData } from '../api/thegraph/uniPoolHourDatas';
+import { getPoolHourDataPaginated } from '../api/thegraph/uniPoolHourDatasPaginated';
 
-import { selectBaseToken, selectBaseTokenId, selectPool, selectPoolID } from '../store/pool';
+import { selectBaseToken, selectBaseTokenId, selectPool, selectPoolID, setCachedHourlyData } from '../store/pool';
 import { selectProtocolId } from '../store/protocol';
 import {  selectSelectedStrategyRanges, selectStrategyRangeType } from '../store/strategyRanges';
 import { selectInvestment } from '../store/investment';
 import { selectSelectedEditableStrategyRanges, selectEditableStrategyRanges } from '../store/strategyRanges';
-import { selectTokenRatios } from '../store/tokenRatios'
+import { selectTokenRatios } from '../store/tokenRatios';
+import { setBacktestDays } from '../store/prediction';
 import HelpText from '../data/HelpText';
 
 import { BarChartGrouped } from '../components/charts/BarChart';
 import { MouseOverText } from '../components/charts/MouseOverMarker';
 import { ToggleButtonsFlex } from '../components/ButtonList';
+import LoadingProgress from '../components/LoadingProgress';
 import BacktestIndicators from '../components/uniswap/BacktestIndicators';
 import { BacktestTotalReturn, BacktestTotalReturnPercent } from '../components/uniswap/BacktestTotalReturn';
 import RangeSlider from '../components/RangeSlider';
@@ -30,7 +33,9 @@ import ToolTip from '../components/ToolTip';
 
 const fromDateForHourlyData = (days) => {
   const date = new Date();
-  return Math.round( (date.setDate(date.getDate() - days) / 1000 ));
+  const timestamp = Math.round(date.setDate(date.getDate() - days) / 1000);
+  console.log(`[fromDateForHourlyData] Days: ${days}, Timestamp: ${timestamp}, Date: ${new Date(timestamp * 1000).toISOString()}`);
+  return timestamp;
 }
 
 
@@ -75,11 +80,12 @@ const StrategyBreakdown = (props) => {
 
 const StrategyBacktest = (props) => {
 
+  const dispatch = useDispatch();
   const pool = useSelector(selectPool);
   const poolID = useSelector(selectPoolID);
   const protocolID = useSelector(selectProtocolId);
   const baseTokenId = useSelector(selectBaseTokenId);
-  const baseToken = useSelector(selectBaseToken)
+  const baseToken = useSelector(selectBaseToken);
   const investment = useSelector(selectInvestment);
   const strategyRanges = useSelector(selectSelectedStrategyRanges);
   const strategyType = useSelector(selectStrategyRangeType)
@@ -87,8 +93,9 @@ const StrategyBacktest = (props) => {
   const tokenRatios = useSelector(selectTokenRatios);
   const [strategies, setStrategies] = useState();
   const [dataLoading, setDataLoading] = useState(true)
- 
+
   const [days, setDays] = useState(30);
+  const [loadingProgress, setLoadingProgress] = useState({ current: 0, total: 0 });
   const [entryPrice, setEntryPrice] = useState();
   const [liquidationData, setLiquidationData] = useState();
   const [liquidationLines, setLiquidationLines] = useState([]);
@@ -105,6 +112,7 @@ const StrategyBacktest = (props) => {
 
   const handleDaysChange = (days) => {
     setDays(days);
+    dispatch(setBacktestDays(days));  // Sync with Redux for AI Prediction
   }
 
   const rangeValFromPercent = (currentPrice, strategy, key) => {
@@ -135,16 +143,78 @@ const StrategyBacktest = (props) => {
     if (props.customFeeDivisor) { setStrategies(editableStrategyRanges) } else { setStrategies(strategyRanges) }
   }, [props.customFeeDivisor, editableStrategyRanges, strategyRanges])
 
-  // Hourly Pool Data
+  // Hourly Pool Data - with pagination and caching
   useEffect(() => {
-   
     const abortController = new AbortController();
-    getPoolHourData(poolID, fromDateForHourlyData(days), abortController.signal, protocolID).then( d => 
-      setHourlyPoolData(d && d.length ? d.reverse() : null) 
-    );
-    return () => { abortController.abort() };
+    let isActive = true;
 
-  }, [poolID, days, protocolID]);
+    // Cache miss - fetch new data
+    const totalChunks = Math.ceil(days / 40);
+    setLoadingProgress({ current: 0, total: totalChunks });
+    setDataLoading(true);
+
+    // Use pagination for periods > 41 days, otherwise use single fetch
+    const fetchPromise = days > 41
+      ? getPoolHourDataPaginated(
+          poolID,
+          fromDateForHourlyData(days),
+          abortController.signal,
+          protocolID,
+          (currentChunk) => setLoadingProgress({
+            current: currentChunk,
+            total: totalChunks
+          })
+        )
+      : getPoolHourData(
+          poolID,
+          fromDateForHourlyData(days),
+          abortController.signal,
+          protocolID
+        );
+
+    fetchPromise.then(d => {
+      // Only update state if this effect hasn't been cleaned up
+      if (!isActive) return;
+
+      const sortedData = d && d.length ? d.reverse() : null;
+
+      // Debug: Check data structure
+      if (sortedData && sortedData.length > 0) {
+        console.log('[StrategyBacktest] First record:', sortedData[0]);
+        console.log('[StrategyBacktest] Last record:', sortedData[sortedData.length - 1]);
+        console.log('[StrategyBacktest] Total records:', sortedData.length);
+        console.log('[StrategyBacktest] Sample close values:', sortedData.slice(0, 5).map(r => r.close));
+      } else {
+        console.warn('[StrategyBacktest] No data returned!');
+      }
+
+      // Save to Redux cache
+      if (sortedData) {
+        dispatch(setCachedHourlyData({
+          poolId: poolID,
+          data: sortedData,
+          fetchedDays: days
+        }));
+      }
+
+      setHourlyPoolData(sortedData);
+      setDataLoading(false);
+    }).catch(err => {
+      // Ignore abort errors - they're expected when component unmounts or deps change
+      if (err.name === 'AbortError' || !isActive) {
+        console.log('[StrategyBacktest] Request aborted');
+        return;
+      }
+      console.error('Fetch failed:', err);
+      setDataLoading(false);
+    });
+
+    return () => {
+      isActive = false;
+      abortController.abort();
+    };
+
+  }, [poolID, days, protocolID, dispatch]);
 
   // Generate Estimated Fees displayed on Backtest chart for all Strategies
 
@@ -277,7 +347,7 @@ const StrategyBacktest = (props) => {
       <div className={`title ${styles['strategy-backtest-title']}`}>
         <span>{props.page === "uniswap" ? "Strategy Backtest" : ""}</span>
         
-        <RangeSlider className={styles['range-slider-backtest-days']} handleInputChange={handleDaysChange} min={5} max={30} value={days} step={1}></RangeSlider>
+        <RangeSlider className={styles['range-slider-backtest-days']} handleInputChange={handleDaysChange} min={5} max={180} value={days} step={1}></RangeSlider>
         
         <span className={props.pageStyle['help-icon']} style={{marginLeft: 0}}>
         <ToolTip textStyle={{width: "450px", height: "fill-content", left:"-450px", top: "20px", border: props.page === 'perpetual' ? "0.5px solid black" : "", textAlign: "left"}} 
@@ -304,6 +374,14 @@ const StrategyBacktest = (props) => {
         
 
       </div>
+
+      {dataLoading && loadingProgress.total > 1 && (
+        <LoadingProgress
+          current={loadingProgress.current}
+          total={loadingProgress.total}
+          className={styles['loading-progress']}
+        />
+      )}
 
       <BarChartGrouped className={`${props.pageStyle ? props.pageStyle["inner-glow"] : "inner-glow"} ${styles['strategy-backtest-chart']}`}
         onMouseLeave={() => { setMouseOverText([]) } }

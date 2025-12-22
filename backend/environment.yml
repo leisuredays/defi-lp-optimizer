@@ -1,0 +1,41 @@
+name: uniswap-v3-backend
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.9
+  - pip
+
+  # Machine Learning (conda-managed for better performance)
+  - pytorch=2.1.0
+  - numpy=1.24.3
+
+  # Data Processing
+  - pandas=2.0.3
+
+  # pip-only packages
+  - pip:
+      # Core Web Framework
+      - fastapi==0.104.1
+      - uvicorn[standard]==0.24.0
+      - pydantic==2.5.0
+      - python-dotenv==1.0.0
+
+      # Machine Learning
+      - stable-baselines3==2.1.0
+      - gym==0.26.2
+      - gymnasium==0.29.1
+
+      # Data Processing
+      - pyarrow==14.0.1
+      - pyyaml==6.0.1
+
+      # HTTP Client
+      - httpx==0.25.0
+      - aiohttp==3.9.0
+
+      # Testing
+      - pytest==7.4.3
+      - pytest-asyncio==0.21.1
