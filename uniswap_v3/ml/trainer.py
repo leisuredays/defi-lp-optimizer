@@ -72,12 +72,16 @@ def load_data(data_path: Path, train_ratio: float = 0.8):
 
 
 def create_env(data: pd.DataFrame, pool_config: dict, investment: float = 10000):
-    """환경 생성"""
+    """환경 생성 - 전체 데이터를 1회 에피소드로 사용"""
+    # 전체 데이터 길이를 에피소드 길이로 설정 (버퍼 10시간 제외)
+    episode_length = len(data) - 10
+    print(f"📈 Episode length: {episode_length} hours ({episode_length/24:.0f} days)")
+
     env = UniswapV3LPEnv(
         historical_data=data,
         pool_config=pool_config,
         initial_investment=investment,
-        episode_length_hours=720,  # 30 days
+        episode_length_hours=episode_length,
     )
     env = Monitor(env)
     return env

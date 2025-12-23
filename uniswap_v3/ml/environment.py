@@ -14,8 +14,14 @@ import math
 from ..math import (
     price_to_tick,
     tick_to_price,
+    tick_to_sqrt,
+    snap_tick,
+    amounts_to_L,
+    L_to_amounts,
+    fee_delta,
     split_tokens as optimal_token_split,
 )
+from ..constants import Q128, TICK_SPACINGS
 
 # uniswap_v3.ml.adapter에서 고수준 래퍼 import
 from .adapter import (
@@ -57,7 +63,8 @@ class UniswapV3LPEnv(gym.Env):
                  episode_length_hours: int = 720,  # 30 days
                  reward_weights: Optional[Dict[str, float]] = None,
                  obs_dim: int = 28,
-                 debug: bool = False):
+                 debug: bool = False,
+                 invert_price: bool = False):
         """
         Initialize the Uniswap V3 LP optimization environment.
 
@@ -70,10 +77,12 @@ class UniswapV3LPEnv(gym.Env):
             reward_weights: Dict with α, β, γ, δ, ε for reward function tuning
             obs_dim: Observation dimension (24 or 28). Use 24 for models trained before v3.
             debug: Enable debug logging for rebalancing decisions
+            invert_price: If True, invert prices (token0 is stablecoin case)
         """
         super().__init__()
         self.obs_dim = obs_dim
         self.debug = debug
+        self.invert_price = invert_price
 
         # Environment configuration
         self.historical_data = historical_data
@@ -101,12 +110,13 @@ class UniswapV3LPEnv(gym.Env):
         }
 
         # Gas cost estimates by protocol (in USD)
+        # Lowered to $10 for Ethereum to encourage more rebalancing
         self.gas_costs = {
-            'ethereum': 100,
-            'polygon': 2,
-            'arbitrum': 3,
-            'optimism': 3,
-            'celo': 1
+            'ethereum': 10,
+            'polygon': 1,
+            'arbitrum': 1,
+            'optimism': 1,
+            'celo': 0.5
         }
 
         # Get protocol (handle both int ID and string name)
@@ -151,6 +161,13 @@ class UniswapV3LPEnv(gym.Env):
         self.initial_token_amounts = [0.0, 0.0]  # Current position's mint tokens (updates at each rebalancing)
         self.current_position_value = 0.0  # Actual position value (decreases with IL/gas, increases with fees)
         self.mint_price = 0.0  # Price when current position was minted (for IL calculation)
+
+        # Fee growth tracking (backtest-accurate fee calculation)
+        self.prev_fg0 = 0  # Previous feeGrowthGlobal0X128
+        self.prev_fg1 = 0  # Previous feeGrowthGlobal1X128
+        self.tick_lower = 0  # Position tick lower bound
+        self.tick_upper = 0  # Position tick upper bound
+        self.backtest_L = 0  # Liquidity calculated exactly like backtest.py
 
         # Precompute features for efficiency
         self._precompute_features()
@@ -273,6 +290,16 @@ class UniswapV3LPEnv(gym.Env):
         self.total_rebalances = 0
         self.current_position_value = self.initial_investment  # Start with full investment
 
+        # Initialize fee growth tracking (backtest-accurate fee calculation)
+        self.prev_fg0 = int(current_data.get('feeGrowthGlobal0X128', 0) or 0)
+        self.prev_fg1 = int(current_data.get('feeGrowthGlobal1X128', 0) or 0)
+
+        # Initialize tick bounds for position
+        self._update_tick_bounds()
+
+        # Calculate backtest-compatible liquidity
+        self._update_backtest_L()
+
         # Gymnasium requires reset() to return (observation, info)
         info = {
             'episode_start_idx': self.episode_start_idx,
@@ -345,6 +372,12 @@ class UniswapV3LPEnv(gym.Env):
         )
         self.initial_token_amounts = tokens  # Mint tokens for this position
         self._initial_range_set = True
+
+        # Update tick bounds for fee calculation
+        self._update_tick_bounds()
+
+        # Update backtest-compatible liquidity
+        self._update_backtest_L()
 
         if self.debug:
             print(f"[Env] Initial range set by AI:")
@@ -644,18 +677,124 @@ class UniswapV3LPEnv(gym.Env):
         if debug:
             print(f"  ✓ REBALANCED: New range [{new_min:.8f}, {new_max:.8f}]")
 
+        # Update tick bounds for fee calculation
+        self._update_tick_bounds()
+
+        # Update backtest-compatible liquidity
+        self._update_backtest_L()
+
         return True  # Rebalancing occurred
+
+    def _update_tick_bounds(self) -> None:
+        """
+        Update tick bounds for the current position.
+
+        Called after position range changes (reset, rebalance).
+
+        Note: position_min_price/max_price are in token0/token1 format (e.g., WETH/USDT)
+              but price_to_tick expects token1/token0 format (e.g., USDT/WETH)
+              So we need to invert the prices before conversion.
+        """
+        token0_decimals = self.pool_config['token0']['decimals']
+        token1_decimals = self.pool_config['token1']['decimals']
+        fee_tier = self.pool_config['feeTier']
+        tick_spacing = TICK_SPACINGS.get(fee_tier, 60)
+
+        # Invert prices: position prices are token0/token1, price_to_tick expects token1/token0
+        # Lower tick corresponds to HIGHER price in token1/token0 format
+        # (because lower price in token0/token1 = higher price in token1/token0)
+        if self.position_min_price > 0 and self.position_max_price > 0:
+            inverted_min = 1.0 / self.position_min_price  # Higher value in inverted format
+            inverted_max = 1.0 / self.position_max_price  # Lower value in inverted format
+
+            tick_lower = price_to_tick(inverted_max, token0_decimals, token1_decimals)
+            tick_upper = price_to_tick(inverted_min, token0_decimals, token1_decimals)
+        else:
+            tick_lower = 0
+            tick_upper = 0
+
+        # Snap to valid tick spacing
+        tick_lower = snap_tick(tick_lower, tick_spacing)
+        tick_upper = snap_tick(tick_upper, tick_spacing)
+
+        # Ensure correct order
+        if tick_lower > tick_upper:
+            tick_lower, tick_upper = tick_upper, tick_lower
+
+        self.tick_lower = tick_lower
+        self.tick_upper = tick_upper
+
+    def _update_backtest_L(self) -> None:
+        """
+        Calculate liquidity EXACTLY like backtest.py.
+
+        Uses amounts_to_L with the same methodology as backtest.py.
+        """
+        token0_decimals = self.pool_config['token0']['decimals']
+        token1_decimals = self.pool_config['token1']['decimals']
+
+        # Get current tick from environment
+        current_idx = self.episode_start_idx + self.current_step
+        current_data = self.features_df.iloc[current_idx]
+
+        if 'tick' in current_data.index:
+            current_tick = int(current_data['tick'])
+        else:
+            self.backtest_L = 0
+            return
+
+        # Get price from tick (USDT/WETH format like backtest.py)
+        P0 = tick_to_price(current_tick, token0_decimals, token1_decimals)
+        if self.invert_price and P0 != 0:
+            P0 = 1 / P0
+
+        # Get range prices in USDT/WETH format
+        # position_min/max are in WETH/USDT, so invert them
+        if self.position_min_price > 0 and self.position_max_price > 0:
+            Pa = 1 / self.position_min_price  # Lower bound in USDT/WETH
+            Pb = 1 / self.position_max_price  # Upper bound in USDT/WETH
+            if Pa > Pb:
+                Pa, Pb = Pb, Pa
+        else:
+            self.backtest_L = 0
+            return
+
+        # Calculate optimal token split (EXACT backtest.py)
+        x_human, y_human = optimal_token_split(self.current_position_value, P0, Pa, Pb)
+        x_amount = int(x_human * (10 ** token0_decimals))
+        y_amount = int(y_human * (10 ** token1_decimals))
+
+        # Calculate liquidity (EXACT backtest.py)
+        sqrt_price_initial = tick_to_sqrt(current_tick)
+        sqrt_price_lower = tick_to_sqrt(self.tick_lower)
+        sqrt_price_upper = tick_to_sqrt(self.tick_upper)
+
+        self.backtest_L = amounts_to_L(
+            sqrt_price_initial,
+            sqrt_price_lower,
+            sqrt_price_upper,
+            x_amount,
+            y_amount
+        )
+
+    def _get_price_from_tick(self, tick: int) -> float:
+        """
+        Convert tick to human-readable price, respecting invert_price setting.
+        """
+        token0_decimals = self.pool_config['token0']['decimals']
+        token1_decimals = self.pool_config['token1']['decimals']
+        p = tick_to_price(tick, token0_decimals, token1_decimals)
+        return 1/p if self.invert_price and p != 0 else p
 
     def _calculate_fees(self, current_data: pd.Series, next_data: pd.Series) -> float:
         """
-        Calculate fees using Whitepaper formula (Section 6.3, 6.4).
+        Calculate fees - EXACT copy of backtest.py logic.
 
-        백서 공식:
-            f_r = f_g - f_b(i_l) - f_a(i_u)  (범위 내 수수료 성장률)
-            fees = L × (f_r(t₁) - f_r(t₀)) / Q128
-
-        단순화 버전 (feeGrowthOutside 없을 때):
-            fees = L × Δf_g × active_ratio / Q128
+        수수료 공식 (backtest.py 동일):
+            1. tick 기반 in_range 체크 (binary)
+            2. in_range일 때만 수수료 적립
+            3. fees = L × Δfee_growth / Q128
+            4. prev_fg는 매 step 업데이트 (out of range 포함)
 
         Args:
             current_data: Current hour data
@@ -664,67 +803,69 @@ class UniswapV3LPEnv(gym.Env):
         Returns:
             Fees earned (USD)
         """
-        # get_tick_from_price, active_liquidity_for_candle already imported from uniswap_v3_adapter
+        fees_usd = 0.0
 
-        # Get feeGrowthGlobal data
-        fg_start_0 = int(current_data.get('feeGrowthGlobal0X128', 0) or 0)
-        fg_end_0 = int(next_data.get('feeGrowthGlobal0X128', 0) or 0)
-        fg_start_1 = int(current_data.get('feeGrowthGlobal1X128', 0) or 0)
-        fg_end_1 = int(next_data.get('feeGrowthGlobal1X128', 0) or 0)
-
-        # If feeGrowthGlobal not available, fallback to TVL-based calculation
-        if fg_end_0 == 0 and fg_end_1 == 0:
-            return self._calculate_fees_tvl_fallback(current_data, next_data)
-
-        # Get price range for this hour
-        low_price = float(next_data.get('low', next_data['close']))
-        high_price = float(next_data.get('high', next_data['close']))
-        current_price = float(next_data['close'])
-
-        if np.isnan(low_price) or np.isnan(high_price) or low_price <= 0 or high_price <= 0:
+        # Get current tick from next_data
+        if 'tick' not in next_data.index:
+            self._update_prev_fg(next_data)
             return 0.0
 
-        # Convert prices to ticks for active liquidity calculation
-        try:
-            low_tick = get_tick_from_price(low_price, self.pool_config, 0)
-            high_tick = get_tick_from_price(high_price, self.pool_config, 0)
-            min_tick = get_tick_from_price(self.position_min_price, self.pool_config, 0)
-            max_tick = get_tick_from_price(self.position_max_price, self.pool_config, 0)
-        except Exception:
-            return 0.0
-
-        # Calculate active liquidity percentage (0-100)
-        active_liq = active_liquidity_for_candle(min_tick, max_tick, low_tick, high_tick)
-
-        if active_liq <= 0:
-            return 0.0  # Position was out of range entire hour
-
-        # Get token decimals
+        current_tick = int(next_data['tick'])
         token0_decimals = self.pool_config['token0']['decimals']
         token1_decimals = self.pool_config['token1']['decimals']
 
-        # Use whitepaper formula for fee calculation
-        fees_usd = calculate_fees_whitepaper(
-            liquidity=self.liquidity,
-            fg_start_0=fg_start_0,
-            fg_end_0=fg_end_0,
-            fg_start_1=fg_start_1,
-            fg_end_1=fg_end_1,
-            active_pct=active_liq,
-            decimals0=token0_decimals,
-            decimals1=token1_decimals,
-            price=current_price
-        )
+        # Get current price (USDT/WETH format for fee USD conversion)
+        current_price = tick_to_price(current_tick, token0_decimals, token1_decimals)
+        if self.invert_price and current_price != 0:
+            current_price = 1 / current_price
 
-        # Sanity check: cap at 1% of investment per hour (realistic maximum)
-        max_reasonable = self.initial_investment * 0.01
-        fees_usd = min(fees_usd, max_reasonable)
+        # Binary in_range check (backtest.py style)
+        in_range = self.tick_lower <= current_tick <= self.tick_upper
 
-        # Replace NaN with 0
+        if in_range:
+            # Get current fee growth values
+            curr_fg0 = int(next_data.get('feeGrowthGlobal0X128', 0) or 0)
+            curr_fg1 = int(next_data.get('feeGrowthGlobal1X128', 0) or 0)
+
+            # If feeGrowthGlobal not available, fallback
+            if curr_fg0 == 0 and curr_fg1 == 0:
+                fees_usd = self._calculate_fees_tvl_fallback(current_data, next_data)
+            else:
+                # Calculate fee delta (handles wrap-around)
+                delta_fg0 = fee_delta(curr_fg0, self.prev_fg0)
+                delta_fg1 = fee_delta(curr_fg1, self.prev_fg1)
+
+                # Calculate raw fee amounts (EXACT backtest.py formula)
+                L = self.backtest_L  # Use backtest-compatible L
+                if L > 0:
+                    fee0_raw = (L * delta_fg0) // Q128
+                    fee1_raw = (L * delta_fg1) // Q128
+
+                    # Convert to USD (EXACT backtest.py logic)
+                    if self.invert_price:
+                        # token0 is stablecoin
+                        fee0_usd = fee0_raw / 10**token0_decimals
+                        fee1_usd = (fee1_raw / 10**token1_decimals) * current_price
+                    else:
+                        # token1 is stablecoin (USDT)
+                        fee0_usd = (fee0_raw / 10**token0_decimals) * current_price
+                        fee1_usd = fee1_raw / 10**token1_decimals
+
+                    fees_usd = fee0_usd + fee1_usd
+
+        # ALWAYS update prev_fg at end of step (even when out of range)
+        self._update_prev_fg(next_data)
+
+        # Replace NaN/inf with 0
         if np.isnan(fees_usd) or np.isinf(fees_usd):
             return 0.0
 
         return fees_usd
+
+    def _update_prev_fg(self, data: pd.Series) -> None:
+        """Update previous fee growth values from data row."""
+        self.prev_fg0 = int(data.get('feeGrowthGlobal0X128', 0) or 0)
+        self.prev_fg1 = int(data.get('feeGrowthGlobal1X128', 0) or 0)
 
     def _calculate_fees_tvl_fallback(self, current_data: pd.Series, next_data: pd.Series) -> float:
         """
@@ -804,10 +945,6 @@ class UniswapV3LPEnv(gym.Env):
 
         # Calculate position fees
         position_fees = total_pool_fees * effective_share * (active_liq / 100.0)
-
-        # Sanity check: cap at 1% of investment per hour
-        max_reasonable = self.initial_investment * 0.01
-        position_fees = min(position_fees, max_reasonable)
 
         # Replace NaN with 0
         if np.isnan(position_fees) or np.isinf(position_fees):
@@ -918,19 +1055,19 @@ class UniswapV3LPEnv(gym.Env):
 
     def _is_position_failed(self, current_price: float) -> bool:
         """
-        Check if position is in failed state (out of range too long).
+        Check if position is in failed state.
+
+        NOTE: Early termination disabled to allow model to learn
+        long-term rebalancing strategies without artificial cutoff.
 
         Args:
             current_price: Current market price
 
         Returns:
-            True if position has failed
+            Always False (no early termination)
         """
-        # Out of range for >48 hours
-        if current_price <= self.position_min_price or current_price >= self.position_max_price:
-            if self.time_since_last_rebalance > 48:
-                return True
-
+        # Disabled: Let model learn to handle out-of-range situations
+        # Previously: terminated if out of range > 48 hours
         return False
 
     def _calculate_tokens_for_range(self, total_value: float, current_price: float,
