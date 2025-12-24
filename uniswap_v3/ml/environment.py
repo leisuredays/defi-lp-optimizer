@@ -622,6 +622,38 @@ class UniswapV3LPEnv(gym.Env):
         )
 
         # ===================================================================
+        # MINIMUM RANGE WIDTH ENFORCEMENT
+        # Prevent 0-width or too narrow positions that can't earn fees
+        # ===================================================================
+        MIN_RANGE_WIDTH_PCT = 0.02  # Minimum 2% width
+
+        range_width = (new_max - new_min) / current_price if current_price > 0 else 0
+
+        if range_width < MIN_RANGE_WIDTH_PCT:
+            # Expand range symmetrically to meet minimum width
+            half_width = current_price * MIN_RANGE_WIDTH_PCT / 2
+            new_min = current_price - half_width
+            new_max = current_price + half_width
+
+            # Re-round to valid ticks after expansion
+            new_min = round_to_nearest_tick(
+                new_min,
+                fee_tier,
+                self.pool_config['token0']['decimals'],
+                self.pool_config['token1']['decimals']
+            )
+            new_max = round_to_nearest_tick(
+                new_max,
+                fee_tier,
+                self.pool_config['token0']['decimals'],
+                self.pool_config['token1']['decimals']
+            )
+
+            if self.debug:
+                print(f"  [MIN_WIDTH] Expanded range to {MIN_RANGE_WIDTH_PCT*100:.1f}%: "
+                      f"[{new_min:.4f}, {new_max:.4f}]")
+
+        # ===================================================================
         # REBALANCING LOGIC: Full Model Autonomy
         # No forced rebalancing, no cooldown - model has full control
         # ===================================================================
