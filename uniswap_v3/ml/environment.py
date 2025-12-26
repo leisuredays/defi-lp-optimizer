@@ -37,6 +37,9 @@ from .adapter import (
     liquidity_for_strategy,
 )
 
+# HMM regime detection
+from .regime import RegimeDetector
+
 
 class UniswapV3LPEnv(gym.Env):
     """
@@ -154,6 +157,7 @@ class UniswapV3LPEnv(gym.Env):
         self.cumulative_fees = 0.0
         self.cumulative_il = 0.0  # Sum of IL from each position (accumulated when rebalancing)
         self.unrealized_il = 0.0  # Current unrealized IL (for display, not accumulated)
+        self.cumulative_lvr = 0.0  # Sum of LVR penalties (accumulated every step)
         self.cumulative_gas = 0.0
         self.time_since_last_rebalance = 0
         self.total_rebalances = 0
@@ -172,9 +176,25 @@ class UniswapV3LPEnv(gym.Env):
         # Precompute features for efficiency
         self._precompute_features()
 
+        # Initialize HMM regime detector
+        self._init_regime_detector()
+
     def _precompute_features(self):
         """Precompute volatility, momentum, and other features from historical data"""
         df = self.historical_data.copy()
+
+        # Convert price from token0/token1 to token1/token0 format
+        # Database stores WETH/USDT (small numbers like 0.0003)
+        # We need USDT/WETH (large numbers like 2500) for human-readable prices
+        self.invert_price = False  # Track if we're inverting
+        if df['close'].iloc[0] < 1.0:  # Prices are in token0/token1 format
+            self.invert_price = True
+            df['close'] = 1.0 / df['close']
+            if 'high' in df.columns:
+                # Note: high/low are swapped when inverting
+                df['high'], df['low'] = 1.0 / df['low'], 1.0 / df['high']
+            # NOTE: tick does NOT need inversion - tick_to_price already handles decimals correctly
+            # tick=-195238 with d0=18, d1=6 gives price=3321 USDT/WETH (correct!)
 
         # Price features
         df['returns'] = df['close'].pct_change()
@@ -200,6 +220,52 @@ class UniswapV3LPEnv(gym.Env):
         df = df.bfill().ffill().fillna(0)
 
         self.features_df = df
+
+    def _init_regime_detector(self):
+        """Initialize and fit HMM regime detector on historical returns."""
+        # Get returns from preprocessed features
+        returns = self.features_df['returns'].values
+
+        # Create and fit detector
+        self.regime_detector = RegimeDetector(n_regimes=2, lookback=100)
+
+        try:
+            self.regime_detector.fit(returns)
+            print("✅ HMM Regime Detector initialized")
+        except Exception as e:
+            print(f"⚠️ HMM fitting failed: {e}. Using uniform priors.")
+            # Detector will return uniform probabilities if not fitted
+
+        # Cache for regime probabilities (updated each step)
+        self._regime_proba_cache = None
+        self._regime_momentum_cache = None
+
+    def _get_regime_features(self) -> tuple:
+        """
+        Get HMM regime features for current observation.
+
+        Returns:
+            Tuple of (regime_proba, regime_momentum), each shape (2,)
+        """
+        current_idx = self.episode_start_idx + self.current_step
+
+        # Lookback window for regime detection
+        lookback = min(100, current_idx)  # Use up to 100 past returns
+        start_idx = max(0, current_idx - lookback)
+
+        # Get recent returns
+        recent_returns = self.features_df['returns'].iloc[start_idx:current_idx + 1].values
+
+        if len(recent_returns) < 10:
+            # Not enough data for meaningful regime detection
+            return np.array([0.5, 0.5]), np.array([0.0, 0.0])
+
+        # Get regime features
+        regime_proba, regime_momentum = self.regime_detector.get_regime_features(
+            recent_returns, momentum_lookback=10
+        )
+
+        return regime_proba, regime_momentum
 
     def reset(self, seed: Optional[int] = None) -> np.ndarray:
         """
@@ -232,8 +298,8 @@ class UniswapV3LPEnv(gym.Env):
 
         # Initialize with default ranges (will be replaced by AI prediction in backtest)
         # These are only used during training when no initial action is provided
-        range_pct = max(volatility / self.initial_price * 2, 0.05)  # At least 5%
-        range_pct = min(range_pct, 0.20)  # At most 20%
+        range_pct = max(volatility / self.initial_price * 2, 0.10)  # At least 10% (±5%)
+        range_pct = min(range_pct, 0.50)  # At most 50%
 
         self.position_min_price = self.initial_price * (1 - range_pct)
         self.position_max_price = self.initial_price * (1 + range_pct)
@@ -285,6 +351,7 @@ class UniswapV3LPEnv(gym.Env):
         self.cumulative_fees = 0.0
         self.cumulative_il = 0.0  # Sum of IL from all positions
         self.unrealized_il = 0.0  # Current unrealized IL
+        self.cumulative_lvr = 0.0  # Sum of LVR penalties
         self.cumulative_gas = 0.0
         self.time_since_last_rebalance = 0
         self.total_rebalances = 0
@@ -317,41 +384,86 @@ class UniswapV3LPEnv(gym.Env):
         This method should be called immediately after reset() in backtest scenarios
         to use AI-predicted ranges instead of the default formula.
 
+        CRITICAL: Uses SAME logic as _apply_action() for consistency!
+        - action[0]: rebalance decision (ignored for initial range)
+        - action[1]: min_range_factor (-1=narrow 0.5σ, +1=wide 5.0σ)
+        - action[2]: max_range_factor (-1=narrow 0.5σ, +1=wide 5.0σ)
+
         Args:
-            action: [rebalance_confidence, min_multiplier, max_multiplier] from model
+            action: [rebalance_confidence, min_range_factor, max_range_factor] from model
         """
-        # action_to_range is already imported from uniswap_v3_adapter at top of file
-
         current_data = self.features_df.iloc[self.episode_start_idx]
-        current_price_raw = current_data['close']
-        volatility_pct = current_data['volatility_24h']  # This is std dev of returns (percentage)
+        current_price = current_data['close']
 
-        # CRITICAL: The Graph returns prices in token1/token0 format
-        # For USDC/WETH pool: token0=USDC (6 decimals), token1=WETH (18 decimals)
-        # price = 2747 means 2747 USDC per WETH (already human-readable!)
-        # NO INVERSION NEEDED - use price as-is
-        current_price = current_price_raw
+        # Calculate volatility (SAME as _apply_action)
+        lookback = min(24, self.episode_start_idx)
+        if lookback < 2:
+            lookback = 2
 
-        # volatility_24h is std dev of percentage returns (dimensionless)
-        # Convert to absolute price volatility by multiplying by price
-        volatility = volatility_pct * current_price if volatility_pct > 0 else current_price * 0.01
+        start_idx = max(0, self.episode_start_idx - lookback)
+        recent_prices = self.features_df.iloc[start_idx:self.episode_start_idx + 1]['close'].values
+        volatility = np.std(recent_prices)
 
-        # Use shared action_to_range logic with human-readable prices
-        self.position_min_price, self.position_max_price = action_to_range(
-            action,
-            current_price,
-            volatility,
-            self.pool_config['feeTier'],
+        # Handle edge cases
+        if volatility <= 0 or np.isnan(volatility):
+            volatility = current_price * 0.05  # Default to 5% volatility
+
+        # Extract range factors (SAME as _apply_action)
+        # action[0] is rebalance decision - ignored for initial range
+        min_range_factor = float(action[1])
+        max_range_factor = float(action[2])
+
+        # Clip to valid range
+        min_range_factor = max(-1, min(1, min_range_factor))
+        max_range_factor = max(-1, min(1, max_range_factor))
+
+        # Map to volatility multiplier [0.5, 5.0] (SAME as _apply_action)
+        min_multiplier = 0.5 + (min_range_factor + 1) / 2 * 4.5
+        max_multiplier = 0.5 + (max_range_factor + 1) / 2 * 4.5
+
+        # Calculate ranges (SAME as _apply_action)
+        new_min = current_price - (volatility * min_multiplier)
+        new_max = current_price + (volatility * max_multiplier)
+
+        # Safety bounds
+        if new_min <= 0:
+            new_min = current_price * 0.1
+        if new_max <= new_min:
+            new_max = new_min * 1.5
+
+        # Round to valid ticks
+        fee_tier = self.pool_config['feeTier']
+        self.position_min_price = round_to_nearest_tick(
+            new_min,
+            fee_tier,
+            self.pool_config['token0']['decimals'],
+            self.pool_config['token1']['decimals']
+        )
+        self.position_max_price = round_to_nearest_tick(
+            new_max,
+            fee_tier,
             self.pool_config['token0']['decimals'],
             self.pool_config['token1']['decimals']
         )
 
-        # action_to_range returns range in human-readable format (token1/token0)
-        # Keep it as-is since environment uses token1/token0 format
-        # No conversion needed!
+        # Enforce minimum range width (SAME as _apply_action)
+        MIN_RANGE_WIDTH_PCT = 0.10
+        range_width = (self.position_max_price - self.position_min_price) / current_price
+        if range_width < MIN_RANGE_WIDTH_PCT:
+            half_width = current_price * MIN_RANGE_WIDTH_PCT / 2
+            self.position_min_price = round_to_nearest_tick(
+                current_price - half_width, fee_tier,
+                self.pool_config['token0']['decimals'],
+                self.pool_config['token1']['decimals']
+            )
+            self.position_max_price = round_to_nearest_tick(
+                current_price + half_width, fee_tier,
+                self.pool_config['token0']['decimals'],
+                self.pool_config['token1']['decimals']
+            )
 
-        # Update initial_price to match
-        self.initial_price = current_price_raw
+        # Update initial_price
+        self.initial_price = current_price
 
         # Recalculate initial liquidity with new ranges
         tokens = self._calculate_tokens_for_range(
@@ -415,7 +527,8 @@ class UniswapV3LPEnv(gym.Env):
 
         # Simulate trading for 1 hour
         fees_earned = self._calculate_fees(current_data, next_data)
-        gas_cost = self.gas_costs[self.protocol] if did_rebalance else 0.0
+        base_gas_cost = self.gas_costs[self.protocol] if did_rebalance else 0.0
+        swap_cost = 0.0  # Will be calculated in rebalance block
 
         # Update unrealized IL (current snapshot, not accumulated)
         self.unrealized_il = il_raw
@@ -425,24 +538,25 @@ class UniswapV3LPEnv(gym.Env):
         # - Realized IL: IL that was actually incurred when rebalancing (locked in)
         #
         # For reward calculation:
-        # - Full IL penalty when rebalancing (realizes the IL)
-        # - Small observation penalty (10%) otherwise (awareness for model)
+        # - IL is ONLY penalized when rebalancing (when it becomes realized)
+        # - No per-step penalty: IL is a cumulative snapshot, not incremental
+        # - Penalizing snapshot IL every step would double-count the loss
         if did_rebalance:
-            il_incurred = il_raw  # Full IL penalty at rebalancing
+            il_incurred = il_raw  # Full IL penalty at rebalancing (realized)
             self.cumulative_il += il_raw  # Add to realized IL only when rebalancing
         else:
-            il_incurred = il_raw * 0.1  # Small observation penalty for reward only
+            il_incurred = 0.0  # No IL penalty: position not closed, loss not realized
 
         # Update cumulative metrics
         self.cumulative_fees += fees_earned
         # NOTE: cumulative_il is now only updated when rebalancing (above)
-        self.cumulative_gas += gas_cost
+        self.cumulative_gas += base_gas_cost
 
         # Update current position value (reflects actual portfolio value)
         # This happens every step: fees increase value, but IL/gas only realized on rebalance
         if did_rebalance:
             # On rebalance: apply IL and gas cost to position value
-            self.current_position_value = self.current_position_value - il_raw - gas_cost + fees_earned
+            self.current_position_value = self.current_position_value - il_raw - base_gas_cost + fees_earned
         else:
             # No rebalance: only fees affect position value (IL is unrealized)
             self.current_position_value = self.current_position_value + fees_earned
@@ -489,8 +603,9 @@ class UniswapV3LPEnv(gym.Env):
                 current_price
             )
 
-            # Add swap cost to gas (already tracked in cumulative_gas above)
-            # Note: swap_cost is additional cost on top of base gas
+            # Add swap cost to cumulative gas and position value
+            self.cumulative_gas += swap_cost
+            self.current_position_value -= swap_cost
 
             # Recalculate liquidity for new position
             self.liquidity = liquidity_for_strategy(
@@ -510,8 +625,41 @@ class UniswapV3LPEnv(gym.Env):
         else:
             self.time_since_last_rebalance += 1
 
-        # Calculate reward
-        reward = self._calculate_reward(fees_earned, il_incurred, gas_cost, did_rebalance, current_data)
+        # Total gas cost for this step (base gas + swap cost)
+        total_gas_cost = base_gas_cost + swap_cost
+
+        # =================================================================
+        # LVR CALCULATION (Paper: arXiv:2208.06046, arXiv:2501.07508)
+        # LVR is calculated EVERY step (unlike IL which was only on rebalance)
+        # IMPORTANT: Use RETURNS volatility σ, NOT price volatility
+        # =================================================================
+        current_price = current_data['close']
+
+        # Calculate RETURNS volatility (24-hour window)
+        # σ = std(returns) where returns = (P_t - P_{t-1}) / P_{t-1}
+        lookback = min(24, current_idx)
+        if lookback < 3:  # Need at least 3 points for meaningful returns std
+            lookback = 3
+        recent_prices = self.features_df.iloc[current_idx-lookback:current_idx+1]['close'].values
+
+        # Calculate hourly returns
+        returns = np.diff(recent_prices) / recent_prices[:-1]
+        returns_volatility = np.std(returns)
+
+        # Handle edge case: use default 0.2% hourly volatility
+        # (approximately 2% daily volatility / sqrt(24))
+        if returns_volatility <= 0 or np.isnan(returns_volatility):
+            returns_volatility = 0.002
+
+        # Calculate LVR penalty for this step using exact paper formula
+        lvr = self._calculate_lvr(current_price, returns_volatility)
+
+        # Track cumulative LVR
+        self.cumulative_lvr += lvr
+
+        # Calculate reward using LVR-based formula
+        # R = fees - LVR - gas (gas only when rebalancing)
+        reward = self._calculate_reward(fees_earned, lvr, total_gas_cost, did_rebalance, current_data)
 
         # Check episode termination
         self.current_step += 1
@@ -526,17 +674,22 @@ class UniswapV3LPEnv(gym.Env):
         # Info dict
         info = {
             'fees': fees_earned,
-            'il': il_incurred,
+            'lvr': lvr,  # LVR penalty this step
+            'il': il_incurred,  # Keep IL for backward compat
             'realized_il': self.cumulative_il,  # Total IL realized through rebalancing
             'unrealized_il': self.unrealized_il,  # Current unrealized IL
-            'gas': gas_cost,
+            'cumulative_lvr': self.cumulative_lvr,  # Total LVR accumulated
+            'volatility': returns_volatility,  # Returns volatility σ (for debugging)
+            'gas': total_gas_cost,  # Includes base gas + swap cost
+            'swap_cost': swap_cost,  # Swap cost only (for debugging)
             'rebalanced': did_rebalance,
             'total_rebalances': self.total_rebalances,
             'cumulative_fees': self.cumulative_fees,
-            'cumulative_il': self.cumulative_il,  # Keep for backward compat (now = realized only)
+            'cumulative_il': self.cumulative_il,  # Keep for backward compat
             'cumulative_gas': self.cumulative_gas,
-            'net_return': self.cumulative_fees - self.cumulative_il - self.cumulative_gas,
-            'current_position_value': self.current_position_value  # Actual portfolio value
+            'net_return': self.cumulative_fees - self.cumulative_lvr - self.cumulative_gas,  # Use LVR
+            'current_position_value': self.current_position_value,  # Actual portfolio value
+            'in_range': self.tick_lower <= int(current_data.get('tick', 0)) <= self.tick_upper
         }
 
         return self._get_observation(), reward, terminated, truncated, info
@@ -625,7 +778,7 @@ class UniswapV3LPEnv(gym.Env):
         # MINIMUM RANGE WIDTH ENFORCEMENT
         # Prevent 0-width or too narrow positions that can't earn fees
         # ===================================================================
-        MIN_RANGE_WIDTH_PCT = 0.02  # Minimum 2% width
+        MIN_RANGE_WIDTH_PCT = 0.16  # Minimum 16% width (±8%)
 
         range_width = (new_max - new_min) / current_price if current_price > 0 else 0
 
@@ -723,24 +876,31 @@ class UniswapV3LPEnv(gym.Env):
 
         Called after position range changes (reset, rebalance).
 
-        Note: position_min_price/max_price are in token0/token1 format (e.g., WETH/USDT)
-              but price_to_tick expects token1/token0 format (e.g., USDT/WETH)
-              So we need to invert the prices before conversion.
+        When invert_price=True:
+            - position_min_price/max_price are in token1/token0 format (e.g., USDT/WETH)
+            - price_to_tick expects token1/token0 format
+            - No inversion needed, use directly
+        When invert_price=False:
+            - position_min_price/max_price are in token0/token1 format
+            - Need to invert before calling price_to_tick
         """
         token0_decimals = self.pool_config['token0']['decimals']
         token1_decimals = self.pool_config['token1']['decimals']
         fee_tier = self.pool_config['feeTier']
         tick_spacing = TICK_SPACINGS.get(fee_tier, 60)
 
-        # Invert prices: position prices are token0/token1, price_to_tick expects token1/token0
-        # Lower tick corresponds to HIGHER price in token1/token0 format
-        # (because lower price in token0/token1 = higher price in token1/token0)
         if self.position_min_price > 0 and self.position_max_price > 0:
-            inverted_min = 1.0 / self.position_min_price  # Higher value in inverted format
-            inverted_max = 1.0 / self.position_max_price  # Lower value in inverted format
-
-            tick_lower = price_to_tick(inverted_max, token0_decimals, token1_decimals)
-            tick_upper = price_to_tick(inverted_min, token0_decimals, token1_decimals)
+            if self.invert_price:
+                # Prices are already in token1/token0 format (USDT/WETH)
+                # Use directly with price_to_tick
+                tick_lower = price_to_tick(self.position_min_price, token0_decimals, token1_decimals)
+                tick_upper = price_to_tick(self.position_max_price, token0_decimals, token1_decimals)
+            else:
+                # Prices are in token0/token1 format, need to invert
+                inverted_min = 1.0 / self.position_min_price
+                inverted_max = 1.0 / self.position_max_price
+                tick_lower = price_to_tick(inverted_max, token0_decimals, token1_decimals)
+                tick_upper = price_to_tick(inverted_min, token0_decimals, token1_decimals)
         else:
             tick_lower = 0
             tick_upper = 0
@@ -775,16 +935,19 @@ class UniswapV3LPEnv(gym.Env):
             self.backtest_L = 0
             return
 
-        # Get price from tick (USDT/WETH format like backtest.py)
+        # Get price from tick
+        # tick_to_price returns token1/token0 format (USDT/WETH for WETH-USDT pool)
+        # This is already in the correct human-readable format (e.g., 3000 USDT per WETH)
+        # DO NOT invert - tick_to_price already handles decimals correctly
         P0 = tick_to_price(current_tick, token0_decimals, token1_decimals)
-        if self.invert_price and P0 != 0:
-            P0 = 1 / P0
 
-        # Get range prices in USDT/WETH format
-        # position_min/max are in WETH/USDT, so invert them
+        # Get range prices
+        # After _precompute_features fix, position_min/max_price are already
+        # in USDT/WETH format (e.g., 2500, 3500) when invert_price=True
+        # DO NOT invert - they're already correct
         if self.position_min_price > 0 and self.position_max_price > 0:
-            Pa = 1 / self.position_min_price  # Lower bound in USDT/WETH
-            Pb = 1 / self.position_max_price  # Upper bound in USDT/WETH
+            Pa = self.position_min_price  # Lower bound (already USDT/WETH)
+            Pb = self.position_max_price  # Upper bound (already USDT/WETH)
             if Pa > Pb:
                 Pa, Pb = Pb, Pa
         else:
@@ -846,10 +1009,10 @@ class UniswapV3LPEnv(gym.Env):
         token0_decimals = self.pool_config['token0']['decimals']
         token1_decimals = self.pool_config['token1']['decimals']
 
-        # Get current price (USDT/WETH format for fee USD conversion)
+        # Get current price from tick
+        # tick_to_price returns token1/token0 format (e.g., USDT/WETH ~3000)
+        # DO NOT invert - this is already the correct human-readable format
         current_price = tick_to_price(current_tick, token0_decimals, token1_decimals)
-        if self.invert_price and current_price != 0:
-            current_price = 1 / current_price
 
         # Binary in_range check (backtest.py style)
         in_range = self.tick_lower <= current_tick <= self.tick_upper
@@ -873,15 +1036,21 @@ class UniswapV3LPEnv(gym.Env):
                     fee0_raw = (L * delta_fg0) // Q128
                     fee1_raw = (L * delta_fg1) // Q128
 
-                    # Convert to USD (EXACT backtest.py logic)
+                    # Convert to USD
+                    # For WETH-USDT pool (invert_price=True):
+                    #   token0 = WETH → multiply by current_price (USDT/WETH) to get USD
+                    #   token1 = USDT → already in USD
+                    # For USDT-WETH pool (invert_price=False):
+                    #   token0 = USDT → already in USD
+                    #   token1 = WETH → multiply by current_price to get USD
                     if self.invert_price:
-                        # token0 is stablecoin
-                        fee0_usd = fee0_raw / 10**token0_decimals
-                        fee1_usd = (fee1_raw / 10**token1_decimals) * current_price
-                    else:
-                        # token1 is stablecoin (USDT)
+                        # token0=WETH needs price conversion, token1=USDT is stablecoin
                         fee0_usd = (fee0_raw / 10**token0_decimals) * current_price
                         fee1_usd = fee1_raw / 10**token1_decimals
+                    else:
+                        # token0 is stablecoin, token1 needs price conversion
+                        fee0_usd = fee0_raw / 10**token0_decimals
+                        fee1_usd = (fee1_raw / 10**token1_decimals) * current_price
 
                     fees_usd = fee0_usd + fee1_usd
 
@@ -1038,49 +1207,125 @@ class UniswapV3LPEnv(gym.Env):
 
         return il_usd
 
-    def _calculate_reward(self, fees: float, il: float, gas: float,
+    def _calculate_lvr(self, current_price: float, returns_volatility: float) -> float:
+        """
+        Calculate Loss-Versus-Rebalancing (LVR) penalty using EXACT paper formula.
+
+        Paper: "Loss-Versus-Rebalancing" (arXiv:2208.06046)
+        Also used in: arXiv:2501.07508
+
+        EXACT FORMULA:
+            ℓ_t(σ, p_t) = (L × σ²) / 4 × √p_t
+
+        Where:
+            - L: Liquidity in USD-equivalent units
+            - σ: Volatility (returns standard deviation, NOT price std dev)
+            - p_t: Current price (token1/token0, e.g., USDT/WETH)
+
+        For hourly data, the formula naturally applies per hour when σ is hourly volatility.
+
+        Args:
+            current_price: Current market price (token1/token0)
+            returns_volatility: Returns volatility σ (std dev of hourly returns)
+
+        Returns:
+            LVR penalty amount (USD) per hour
+        """
+        # Handle invalid inputs
+        if current_price <= 0 or np.isnan(current_price):
+            return 0.0
+        if returns_volatility <= 0 or np.isnan(returns_volatility):
+            return 0.0
+        if self.backtest_L <= 0:
+            return 0.0
+
+        # =================================================================
+        # EXACT LVR FORMULA FROM PAPER
+        # ℓ = (L × σ²) / 4 × √p
+        # =================================================================
+
+        # Step 1: Convert L from raw on-chain units to USD-equivalent
+        # L is stored in units of sqrt(token0_amount × token1_amount)
+        # To convert to USD scale: divide by 10^((d0 + d1) / 2)
+        # For WETH/USDT: (18 + 6) / 2 = 12
+        token0_decimals = self.pool_config['token0']['decimals']
+        token1_decimals = self.pool_config['token1']['decimals']
+        decimal_adjustment = (token0_decimals + token1_decimals) / 2
+        L_usd = self.backtest_L / (10 ** decimal_adjustment)
+
+        # Step 2: Calculate σ² (returns volatility squared)
+        # returns_volatility is already the std dev of returns (e.g., 0.002 for 0.2%)
+        sigma_squared = returns_volatility ** 2
+
+        # Step 3: Calculate √p (square root of current price)
+        sqrt_price = np.sqrt(current_price)
+
+        # Step 4: Apply the exact paper formula
+        # ℓ = (L_usd × σ²) / 4 × √p
+        lvr = (L_usd * sigma_squared * sqrt_price) / 4.0
+
+        # =================================================================
+        # Sanity checks and caps
+        # =================================================================
+        # Cap LVR at 1% of position value per hour (extreme volatility protection)
+        max_lvr = self.current_position_value * 0.01
+        lvr_capped = min(lvr, max_lvr)
+
+        # Replace NaN/inf with 0
+        if np.isnan(lvr_capped) or np.isinf(lvr_capped):
+            return 0.0
+
+        return lvr_capped
+
+    def _calculate_reward(self, fees: float, lvr: float, gas: float,
                          did_rebalance: bool, current_data: pd.Series) -> float:
         """
-        Calculate reward: α*fees - β*IL - γ*gas
+        Calculate reward using LVR-based formula from paper.
 
-        Rebalancing costs:
-        - IL: Realized at rebalancing (included in il parameter)
-        - Gas: Charged if did_rebalance=True
-        - NO slippage: Uniswap V3 burn/mint has no slippage (not a swap)
+        Paper: arXiv:2501.07508
+        R_{t+1} = f_t - ℓ_t(σ,p) - I[a_t ≠ 0] × g
+
+        Where:
+        - f_t: trading fees earned
+        - ℓ_t(σ,p): LVR penalty (applied every step)
+        - g: gas fee (only when rebalancing)
+
+        Key differences from previous IL-based approach:
+        - LVR is applied EVERY step (not just on rebalancing)
+        - LVR is volatility-based (encourages wider ranges in volatile markets)
+        - Simpler formula without separate α, β, γ coefficients
 
         Args:
             fees: Fees earned this step
-            il: IL incurred this step (realized if rebalanced)
-            gas: Gas cost if rebalanced
+            lvr: LVR penalty this step (applied every step)
+            gas: Gas cost (only if rebalanced)
             did_rebalance: Whether rebalancing occurred
-            current_data: Current market data (unused but kept for compatibility)
+            current_data: Current market data
 
         Returns:
-            Reward value
+            Reward value (bounded by tanh)
         """
-        w = self.reward_weights
-
         # Replace any NaN inputs with 0
         fees = 0.0 if np.isnan(fees) else fees
-        il = 0.0 if np.isnan(il) else il
+        lvr = 0.0 if np.isnan(lvr) else lvr
         gas = 0.0 if np.isnan(gas) else gas
 
-        # Reward: fees - IL - gas
-        # Beta increased to 1.5 (from 0.8) to prioritize capital preservation
-        reward = (
-            w['alpha'] * fees -
-            w['beta'] * il -
-            w['gamma'] * gas
-        )
+        # =================================================================
+        # PAPER-BASED REWARD: R = fees - LVR - gas
+        # arXiv:2501.07508
+        # =================================================================
+        # Key: LVR is applied every step (volatility-based penalty)
+        # Gas is only applied when rebalancing (I[a_t ≠ 0] × g)
+        reward = fees - lvr - gas
 
         # Replace NaN reward with 0
         if np.isnan(reward) or np.isinf(reward):
             reward = 0.0
 
         # Rescale reward using tanh for bounded output (-1, 1)
-        # Scale factor: $1000/hour → tanh(1) ≈ 0.76
-        # This provides smooth, bounded rewards regardless of fee magnitude
-        reward_scaled = reward / 1000.0
+        # Scale factor adjusted for typical hourly fees ($1-5)
+        # $10 change = tanh(1.0) ≈ 0.76 (provides good gradient)
+        reward_scaled = reward / 10.0
         reward_bounded = np.tanh(reward_scaled)
 
         return reward_bounded
@@ -1165,11 +1410,13 @@ class UniswapV3LPEnv(gym.Env):
             return 0.0
 
         # Calculate swap costs
+        # When rebalancing: LP withdraws → swaps → re-deposits
+        # During swap, LP pays pool fee (no longer providing liquidity at that moment)
         fee_tier = self.pool_config['feeTier']
-        pool_fee_rate = fee_tier / 1_000_000  # Convert bps to decimal (500 → 0.0005)
-        slippage_rate = 0.001  # 0.1% slippage (conservative estimate for medium-sized pools)
+        pool_fee_rate = fee_tier / 1_000_000  # e.g., 3000 → 0.003 (0.3%)
+        slippage_rate = 0.001  # 0.1% price impact
 
-        # Total swap cost = swap amount × (fee + slippage)
+        # Total swap cost = swap amount × (pool_fee + slippage)
         swap_cost = swap_amount_usd * (pool_fee_rate + slippage_rate)
 
         return swap_cost
@@ -1228,11 +1475,12 @@ class UniswapV3LPEnv(gym.Env):
                 f21, f22, f23, f24
             ], dtype=np.float32)
         else:
-            # 28-dim: Additional forward-looking features
-            f25 = 0.5  # Liquidity concentration above (placeholder)
-            f26 = 0.5  # Liquidity concentration below (placeholder)
-            f27 = current_data.get('returns', 0) * 24  # Recent fee growth rate
-            f28 = current_data.get('momentum_1h', 0)  # Volume trend
+            # 28-dim: HMM regime features (replaces placeholders)
+            regime_proba, regime_momentum = self._get_regime_features()
+            f25 = regime_proba[0]  # P(low volatility regime)
+            f26 = regime_proba[1]  # P(high volatility regime)
+            f27 = regime_momentum[0]  # Low vol regime transition speed
+            f28 = regime_momentum[1]  # High vol regime transition speed
 
             obs = np.array([
                 f1, f2, f3, f4, f5, f6, f7, f8, f9, f10,

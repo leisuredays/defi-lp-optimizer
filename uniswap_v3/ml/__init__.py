@@ -32,6 +32,7 @@ from ..math import (
 # 고수준 ML 래퍼 (adapter)
 from .adapter import (
     snap_price,
+    snap_price as round_to_nearest_tick,  # Alias for compatibility
     get_tick_from_price,
     calc_liquidity,
     get_token_amounts,
@@ -48,3 +49,6 @@ from .environment import UniswapV3LPEnv
 from .callbacks import RewardLoggingCallback, ProgressCallback
 from .trainer import train
 # from .visualize import create_visualization  # Module not yet implemented
+
+# HMM Regime Detection
+from .regime import RegimeDetector, create_regime_detector

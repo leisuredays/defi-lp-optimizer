@@ -72,6 +72,11 @@ def tick_to_sqrt(tick: int) -> int:
 
 def tick_to_price(tick: int, decimals0: int = 18, decimals1: int = 6) -> float:
     """tick → 가격 (token1/token0)"""
+    # 안전한 tick 범위로 제한 (오버플로우 방지)
+    # WETH/USDT의 경우 실제 tick 범위: 약 -400000 ~ -300000
+    MIN_SAFE_TICK = -500000
+    MAX_SAFE_TICK = 500000
+    tick = max(MIN_SAFE_TICK, min(MAX_SAFE_TICK, tick))
     return 1.0001 ** tick * (10 ** (decimals0 - decimals1))
 
 

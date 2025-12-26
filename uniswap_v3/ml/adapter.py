@@ -30,12 +30,34 @@ from ..math import (
 
 def snap_price(price: float, fee_tier: int, decimals0: int, decimals1: int) -> float:
     """가격을 유효한 tick spacing으로 반올림"""
-    if price <= 0:
-        return price
+    import math
     spacing = TICK_SPACINGS.get(fee_tier, 60)
-    tick = price_to_tick(price, decimals0, decimals1)
-    rounded = snap_tick(tick, spacing)
-    return tick_to_price(rounded, decimals0, decimals1)
+
+    # 실용적인 최소/최대 tick 범위 (오버플로우 방지)
+    # WETH/USDT의 경우 실제 tick 범위: 약 -400000 ~ -300000
+    MIN_SAFE_TICK = -500000
+    MAX_SAFE_TICK = 500000
+
+    # 유효하지 않은 가격 처리 (0, 음수, NaN, Inf)
+    if price <= 0 or not math.isfinite(price):
+        rounded = snap_tick(MIN_SAFE_TICK, spacing)
+        return tick_to_price(rounded, decimals0, decimals1)
+
+    # ratio 계산 후 유효성 검사
+    ratio = price * (10 ** (decimals1 - decimals0))
+    if ratio <= 0 or not math.isfinite(ratio):
+        rounded = snap_tick(MIN_SAFE_TICK, spacing)
+        return tick_to_price(rounded, decimals0, decimals1)
+
+    try:
+        tick = int(math.log(ratio) / math.log(1.0001))
+        # tick 범위 제한
+        tick = max(MIN_SAFE_TICK, min(MAX_SAFE_TICK, tick))
+        rounded = snap_tick(tick, spacing)
+        return tick_to_price(rounded, decimals0, decimals1)
+    except (ValueError, OverflowError):
+        rounded = snap_tick(MIN_SAFE_TICK, spacing)
+        return tick_to_price(rounded, decimals0, decimals1)
 
 
 def get_tick_from_price(price: float, pool_config: Dict[str, Any], base_selected: int = 0) -> int:
@@ -218,25 +240,43 @@ def action_to_range(
     """
     RL action → (min_price, max_price)
 
-    action[0]: 범위 폭 (-1~1 → 1%~50%)
+    action[0]: 범위 폭 (-1~1 → 10%~50%, 최소 ±5%)
     action[1]: 범위 중심 오프셋 (-1~1 → -10%~+10%)
     """
-    width_pct = 0.01 + (action[0] + 1) / 2 * 0.49  # 1%~50%
+    # 입력 유효성 검사
+    if current_price <= 0:
+        raise ValueError(f"current_price must be positive, got {current_price}")
+
+    # action 값 클리핑 (-1 ~ 1)
+    action = [max(-1, min(1, a)) for a in action]
+
+    width_pct = 0.10 + (action[0] + 1) / 2 * 0.40  # 10%~50% (minimum ±5%)
     offset_pct = action[1] * 0.10  # -10%~+10%
 
     center = current_price * (1 + offset_pct)
     half_width = center * width_pct / 2
 
-    min_price = max(center - half_width, current_price * 0.5)
-    max_price = min(center + half_width, current_price * 2.0)
+    # 안전 범위: 최소 현재가격의 10%, 최대 현재가격의 10배
+    min_price = max(center - half_width, current_price * 0.1)
+    max_price = min(center + half_width, current_price * 10.0)
 
+    # snap_price는 이제 항상 유효한 가격 반환
     min_price = snap_price(min_price, fee_tier, decimals0, decimals1)
     max_price = snap_price(max_price, fee_tier, decimals0, decimals1)
 
+    # min >= max인 경우 안전하게 처리
     if min_price >= max_price:
         spacing = TICK_SPACINGS.get(fee_tier, 60)
-        min_tick = price_to_tick(min_price, decimals0, decimals1)
-        max_price = tick_to_price(min_tick + spacing, decimals0, decimals1)
+        # snap_price 후에는 항상 유효한 가격이므로 안전하게 변환 가능
+        try:
+            min_tick = price_to_tick(min_price, decimals0, decimals1)
+            max_price = tick_to_price(min_tick + spacing, decimals0, decimals1)
+        except ValueError:
+            # 최후의 안전장치: 기본 범위 사용
+            min_price = current_price * 0.95
+            max_price = current_price * 1.05
+            min_price = snap_price(min_price, fee_tier, decimals0, decimals1)
+            max_price = snap_price(max_price, fee_tier, decimals0, decimals1)
 
     return min_price, max_price
 
