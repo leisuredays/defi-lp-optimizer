@@ -139,15 +139,15 @@ class UniswapV3LPEnv(gym.Env):
         else:
             self.protocol = protocol_raw
 
-        # Action space: Discrete (v8: wider ranges, fewer actions)
-        # action=0: No rebalance (keep current position)
-        # action=1+: Rebalance with tick width = TICK_WIDTH_OPTIONS[action]
+        # Action space: Discrete - ALL actions require a position
+        # NO "no position" option - model MUST choose a range
         # Tick width = total ticks in range (half_width = tick_width // 2)
         # 1 tick ≈ 0.01% price change
-        #   4000 ticks  → ±20%  (medium)
-        #   8000 ticks  → ±40%  (wide)
-        #   16000 ticks → ±80%  (very wide)
-        self.TICK_WIDTH_OPTIONS = [0, 4000, 8000, 16000]  # 4 actions
+        #   500 ticks   → ±2.5%  (very narrow, high fee concentration)
+        #   1000 ticks  → ±5%    (narrow)
+        #   2000 ticks  → ±10%   (medium)
+        #   4000 ticks  → ±20%   (wide)
+        self.TICK_WIDTH_OPTIONS = [500, 1000, 2000, 4000]  # 4 actions, all with positions
         self.action_space = spaces.Discrete(len(self.TICK_WIDTH_OPTIONS))
 
         # Observation space: 11 dimensions (Paper: arXiv:2501.07508)
@@ -180,6 +180,17 @@ class UniswapV3LPEnv(gym.Env):
         self.current_position_value = 0.0  # Actual position value (decreases with IL/gas, increases with fees)
         self.mint_price = 0.0  # Price when current position was minted (for IL calculation)
         self.position_investment = 0.0  # Investment at position creation (fixed until rebalance, for IL calculation)
+
+        # HODL tracking for LP vs HODL excess return calculation
+        self.hodl_token0 = 0.0  # Initial token0 amount (fixed throughout episode)
+        self.hodl_token1 = 0.0  # Initial token1 amount (fixed throughout episode)
+        self.prev_excess_return = 0.0  # Previous step's excess return (for delta calculation)
+
+        # Auto-rebalancing based on IL graph analysis (70% threshold)
+        # See docs/il_graph.png - Position Quality vs IL Risk
+        self.desired_tick_width = self.TICK_WIDTH_OPTIONS[0]  # Model's chosen tick width
+        self.current_tick_width = 0  # Current position's tick width
+        self.rebalance_threshold = 0.70  # 70% edge proximity triggers rebalance
 
         # Fee growth tracking (backtest-accurate fee calculation)
         self.prev_fg0 = 0  # Previous feeGrowthGlobal0X128
@@ -216,8 +227,16 @@ class UniswapV3LPEnv(gym.Env):
         # Paper (arXiv:2501.07508): Exponentially weighted volatility with α=0.05
         df['ewma_volatility'] = df['returns'].ewm(alpha=0.05).std()
         df['volatility_24h'] = df['ewma_volatility']  # Alias for backward compatibility
+
+        # Multi-scale volatility (rolling std of returns)
+        df['volatility_72h'] = df['returns'].rolling(72).std()   # 3 days
+        df['volatility_168h'] = df['returns'].rolling(168).std()  # 1 week
+
+        # Multi-scale momentum (price change over different horizons)
         df['momentum_1h'] = df['close'].pct_change(1)
-        df['momentum_24h'] = df['close'].pct_change(24)
+        df['momentum_24h'] = df['close'].pct_change(24)    # 1 day
+        df['momentum_72h'] = df['close'].pct_change(72)    # 3 days
+        df['momentum_168h'] = df['close'].pct_change(168)  # 1 week
 
         # Paper (arXiv:2501.07508): Moving averages for state space
         df['ma_24h'] = df['close'].rolling(24).mean()
@@ -347,37 +366,43 @@ class UniswapV3LPEnv(gym.Env):
         self.initial_price = current_data['close']
         volatility = current_data['volatility_24h']
 
-        # Initialize with default ranges (will be replaced by AI prediction in backtest)
-        # These are only used during training when no initial action is provided
-        range_pct = max(volatility / self.initial_price * 2, 0.10)  # At least 10% (±5%)
-        range_pct = min(range_pct, 0.50)  # At most 50%
+        # Initialize with default tick_width (medium range: ±10%)
+        # Model can change this via action, triggering rebalance if needed
+        default_tick_width = 2000  # ±10% range
+        self.current_tick_width = default_tick_width
+        self.desired_tick_width = default_tick_width
 
-        self.position_min_price = self.initial_price * (1 - range_pct)
-        self.position_max_price = self.initial_price * (1 + range_pct)
+        # Calculate position from tick_width
+        fee_tier = self.pool_config['feeTier']
+        tick_spacing = TICK_SPACINGS.get(fee_tier, 60)
+        token0_decimals = self.pool_config['token0']['decimals']
+        token1_decimals = self.pool_config['token1']['decimals']
+
+        if self.invert_price:
+            current_tick = price_to_tick(self.initial_price, token0_decimals, token1_decimals)
+        else:
+            current_tick = price_to_tick(1.0 / self.initial_price, token0_decimals, token1_decimals)
+
+        half_width = default_tick_width // 2
+        tick_lower = ((current_tick - half_width) // tick_spacing) * tick_spacing
+        tick_upper = ((current_tick + half_width) // tick_spacing) * tick_spacing
+
+        if tick_upper <= tick_lower:
+            tick_upper = tick_lower + tick_spacing
+
+        new_min = tick_to_price(tick_lower, token0_decimals, token1_decimals)
+        new_max = tick_to_price(tick_upper, token0_decimals, token1_decimals)
+
+        if self.invert_price:
+            self.position_min_price = new_min
+            self.position_max_price = new_max
+        else:
+            self.position_min_price = 1.0 / new_max if new_max > 0 else self.initial_price * 0.9
+            self.position_max_price = 1.0 / new_min if new_min > 0 else self.initial_price * 1.1
+
+        self.tick_lower = tick_lower
+        self.tick_upper = tick_upper
         self._initial_range_set = False  # Flag to track if AI range was set
-
-        # Ensure min_price is always positive (important for log calculations in tick conversion)
-        if self.position_min_price <= 0:
-            # Fallback to 10% below current price if calculation results in negative/zero
-            self.position_min_price = self.initial_price * 0.9
-
-        # Ensure max_price is reasonable
-        if self.position_max_price <= self.position_min_price:
-            self.position_max_price = self.initial_price * 1.1
-
-        # Round to valid ticks
-        self.position_min_price = round_to_nearest_tick(
-            self.position_min_price,
-            self.pool_config['feeTier'],
-            self.pool_config['token0']['decimals'],
-            self.pool_config['token1']['decimals']
-        )
-        self.position_max_price = round_to_nearest_tick(
-            self.position_max_price,
-            self.pool_config['feeTier'],
-            self.pool_config['token0']['decimals'],
-            self.pool_config['token1']['decimals']
-        )
 
         # Calculate initial liquidity
         tokens = self._calculate_tokens_for_range(
@@ -410,6 +435,17 @@ class UniswapV3LPEnv(gym.Env):
         self.total_rebalances = 0
         self.current_position_value = self.initial_investment  # Start with full investment
         self.position_investment = self.initial_investment  # Investment at position creation (for IL calc)
+
+        # Initialize HODL portfolio (50:50 split at initial price)
+        # HODL = 초기 투자금을 50:50으로 나눠서 토큰 보유
+        # token0 = stablecoin (USDC), token1 = ETH (when invert_price=True)
+        half_investment = self.initial_investment / 2
+        self.hodl_token0 = half_investment  # $5000 worth of token0
+        self.hodl_token1 = half_investment / self.initial_price  # $5000 worth of token1
+        self.prev_excess_return = 0.0  # Reset excess return tracking
+
+        # Note: current_tick_width and desired_tick_width are set earlier
+        # when initializing the position with default_tick_width
 
         # Initialize fee growth tracking (backtest-accurate fee calculation)
         self.prev_fg0 = int(current_data.get('feeGrowthGlobal0X128', 0) or 0)
@@ -739,12 +775,14 @@ class UniswapV3LPEnv(gym.Env):
         self.cumulative_lvr += lvr
 
         # =================================================================
-        # REWARD CALCULATION: fees - il_delta - gas
-        # IL delta replaces LVR as the per-step penalty
-        # - il_delta > 0: IL increased → penalty
-        # - il_delta < 0: IL decreased → bonus
+        # REWARD CALCULATION: LP vs HODL Excess Return
+        # - LP 수익률 vs HODL 수익률 비교
+        # - 시장 방향성 제거 (상승장/하락장 무관)
+        # - LP가 HODL보다 좋으면 +, 나쁘면 -
         # =================================================================
-        reward = self._calculate_reward_il(fees_earned, il_delta, total_gas_cost, did_rebalance)
+        reward = self._calculate_reward_excess_return(
+            fees_earned, current_data['close'], did_rebalance, total_gas_cost
+        )
 
         # Check episode termination
         self.current_step += 1
@@ -756,47 +794,78 @@ class UniswapV3LPEnv(gym.Env):
         terminated = position_failed  # Episode ended naturally (failure)
         truncated = time_limit_reached and not position_failed  # Episode cut short by time limit
 
+        # Calculate position quality for info dict
+        range_center = (self.position_min_price + self.position_max_price) / 2
+        range_half = (self.position_max_price - self.position_min_price) / 2
+        if range_half > 0 and self.position_min_price <= current_data['close'] <= self.position_max_price:
+            distance = abs(current_data['close'] - range_center) / range_half
+            position_quality = 1.0 - distance
+        elif range_half > 0:
+            if current_data['close'] < self.position_min_price:
+                overshoot = (self.position_min_price - current_data['close']) / range_half
+            else:
+                overshoot = (current_data['close'] - self.position_max_price) / range_half
+            position_quality = -min(overshoot, 2.0)
+        else:
+            position_quality = 0.0
+
         # Info dict
         lvr_weight = self.reward_weights.get('lvr_weight', 1.0)
-        il_weight = self.reward_weights.get('il_weight', 1.0)
+        il_weight = self.reward_weights.get('il_weight', 0.05)  # Updated default for reactive reward
         info = {
             'fees': fees_earned,
-            'il_delta': il_delta,  # Change in IL this step (NEW: used in reward)
-            'lvr': lvr,  # LVR (kept for comparison, not used in reward)
-            'lvr_weight': lvr_weight,  # LVR weight (β) for debugging
-            'il': il_incurred,  # Keep IL for backward compat
-            'realized_il': self.cumulative_il,  # Total IL realized through rebalancing
-            'unrealized_il': self.unrealized_il,  # Current unrealized IL
-            'cumulative_il_delta': self.cumulative_il_delta,  # Total IL delta (NEW: IL-based penalty)
-            'cumulative_lvr': self.cumulative_lvr,  # Total LVR accumulated
-            'volatility': returns_volatility,  # Returns volatility σ (for debugging)
-            'gas': total_gas_cost,  # Includes base gas + swap cost (tracked, not in reward)
-            'swap_cost': swap_cost,  # Swap cost only (for debugging)
+            'il_delta': il_delta,  # Change in IL this step
+            'lvr': lvr,  # LVR (kept for comparison)
+            'lvr_weight': lvr_weight,
+            'il': il_incurred,
+            'realized_il': self.cumulative_il,
+            'unrealized_il': self.unrealized_il,
+            'cumulative_il_delta': self.cumulative_il_delta,
+            'cumulative_lvr': self.cumulative_lvr,
+            'volatility': returns_volatility,
+            'gas': total_gas_cost,
+            'swap_cost': swap_cost,
             'rebalanced': did_rebalance,
             'total_rebalances': self.total_rebalances,
             'cumulative_fees': self.cumulative_fees,
-            'cumulative_il': self.cumulative_il,  # Keep for backward compat
+            'cumulative_il': self.cumulative_il,
             'cumulative_gas': self.cumulative_gas,
-            # NEW: Net return now uses IL delta instead of LVR
             'net_return': self.cumulative_fees - self.cumulative_il_delta - self.cumulative_gas,
-            # reward_net_return = cumulative(fees - IL_delta) - gas excluded from reward
             'reward_net_return': self.cumulative_fees - il_weight * self.cumulative_il_delta,
-            'current_position_value': self.current_position_value,  # Actual portfolio value
-            'in_range': self.tick_lower <= int(current_data.get('tick', 0)) <= self.tick_upper
+            'current_position_value': self.current_position_value,
+            'in_range': self.tick_lower <= int(current_data.get('tick', 0)) <= self.tick_upper,
+            # Position quality metrics
+            'position_quality': position_quality,  # 1=중앙, 0=경계, <0=이탈
+            'range_width_pct': 2 * range_half / current_data['close'] if current_data['close'] > 0 else 0,
+            # LP vs HODL excess return metrics
+            'hodl_value': self._get_hodl_value(current_data['close']),
+            'lp_value': self._get_lp_value(current_data['close']),  # 토큰 가격 반영된 LP 가치
+            'excess_return': self._get_excess_return(current_data['close']),  # LP - HODL 수익률
+            # Auto-rebalancing metrics
+            'edge_proximity': self._calculate_edge_proximity(current_data['close']),
+            'current_tick_width': self.current_tick_width,
+            'desired_tick_width': self.desired_tick_width,
+            # Price info for visualization
+            'current_price': current_data['close'],
+            'position_min_price': self.position_min_price,
+            'position_max_price': self.position_max_price,
         }
 
         return self._get_observation(), reward, terminated, truncated, info
 
     def _apply_action(self, action: int, debug: bool = False) -> bool:
         """
-        Apply discrete action to adjust position ranges (Paper: arXiv:2501.07508).
+        Apply discrete action with AUTO-REBALANCING based on IL graph analysis.
 
-        **Discrete Action Space**:
-        - action=0: No rebalance (keep current position)
-        - action=1,2,3,4,5: Rebalance with tick width = TICK_WIDTH_OPTIONS[action]
+        **Auto-Rebalancing Logic** (see docs/il_graph.png):
+        - Model selects desired tick_width (range size preference)
+        - Actual rebalancing only occurs when:
+          1. No position exists (first step)
+          2. Edge proximity > 70% (IL acceleration zone)
+          3. Tick width changed AND price near edge (>50%)
 
-        The tick width determines symmetric price range centered around current price.
-        Example: tick_width=20 with tick_spacing=10 → range spans 2 ticks above/below.
+        This saves gas by avoiding unnecessary rebalancing while
+        preventing IL acceleration in the danger zone.
 
         Args:
             action: Integer action index (0 to len(TICK_WIDTH_OPTIONS)-1)
@@ -807,25 +876,63 @@ class UniswapV3LPEnv(gym.Env):
         """
         # Get tick width from action
         tick_width = self.TICK_WIDTH_OPTIONS[action]
+        self.desired_tick_width = tick_width  # Store model's preference
 
-        # action=0 means no rebalancing
-        if tick_width == 0:
-            if debug:
-                print(f"[Rebalance] Step {self.current_step}: action=0, no rebalance")
-            return False
-
-        # Get current price and tick
+        # Get current price
         current_idx = self.episode_start_idx + self.current_step
         current_price = self.features_df.iloc[current_idx]['close']
 
         if current_price <= 0 or np.isnan(current_price):
             return False
 
-        # Get tick spacing for this fee tier
+        # Calculate edge proximity (how close to boundary)
+        edge_proximity = self._calculate_edge_proximity(current_price)
+
+        # === ASYMMETRIC AUTO-REBALANCING DECISION ===
+        # Based on IL asymmetry analysis (docs/updownildifference.png):
+        # - Price DOWN (→ lower bound): IL is ~1.8x more sensitive
+        # - Price UP (→ upper bound): IL is gentler
+        #
+        # Asymmetric thresholds:
+        # - Approaching LOWER bound: 65-70% (rebalance earlier!)
+        # - Approaching UPPER bound: 75-80% (can wait longer)
+
+        no_position = self.position_min_price <= 0
+        width_changed = tick_width != self.current_tick_width
+
+        # Determine direction and apply asymmetric threshold
+        if no_position:
+            in_danger_zone = True  # Force initial position
+            direction = "first"
+        else:
+            center = (self.position_min_price + self.position_max_price) / 2
+            if current_price < center:
+                # Approaching LOWER bound → more dangerous (IL ~1.8x more sensitive)
+                threshold = 0.65  # Earlier trigger (65%)
+                direction = "down"
+            else:
+                # Approaching UPPER bound → less dangerous
+                threshold = 0.80  # Later trigger (80%)
+                direction = "up"
+            in_danger_zone = edge_proximity > threshold
+
+        in_warning_zone = edge_proximity > 0.5  # > 50%
+
+        need_rebalance = (
+            no_position or                          # First position
+            in_danger_zone or                       # IL acceleration zone (asymmetric)
+            (width_changed and in_warning_zone)     # Width change near edge
+        )
+
+        if not need_rebalance:
+            if debug:
+                print(f"[NoRebalance] Step {self.current_step}: edge={edge_proximity:.1%}, "
+                      f"dir={direction}, width={tick_width}, current_width={self.current_tick_width}")
+            return False
+
+        # === EXECUTE REBALANCING ===
         fee_tier = self.pool_config['feeTier']
         tick_spacing = TICK_SPACINGS.get(fee_tier, 60)
-
-        # Calculate current tick from price
         token0_decimals = self.pool_config['token0']['decimals']
         token1_decimals = self.pool_config['token1']['decimals']
 
@@ -835,7 +942,6 @@ class UniswapV3LPEnv(gym.Env):
             current_tick = price_to_tick(1.0 / current_price, token0_decimals, token1_decimals)
 
         # Calculate new tick bounds: symmetric around current tick
-        # tick_width is the total width in ticks (paper: arXiv:2501.07508)
         half_width_ticks = tick_width // 2
         new_tick_lower = current_tick - half_width_ticks
         new_tick_upper = current_tick + half_width_ticks
@@ -852,20 +958,22 @@ class UniswapV3LPEnv(gym.Env):
         new_min = tick_to_price(new_tick_lower, token0_decimals, token1_decimals)
         new_max = tick_to_price(new_tick_upper, token0_decimals, token1_decimals)
 
-        # If using inverted prices (token1/token0 like USDT/WETH), swap min/max
+        # Update position prices
         if self.invert_price:
             self.position_min_price = new_min
             self.position_max_price = new_max
         else:
-            # Invert back to token0/token1 format
             self.position_min_price = 1.0 / new_max if new_max > 0 else 0
             self.position_max_price = 1.0 / new_min if new_min > 0 else 0
 
+        # Update current tick width
+        self.current_tick_width = tick_width
+
         if debug:
-            print(f"[Rebalance] Step {self.current_step}: action={action}, tick_width={tick_width}")
-            print(f"  Price: {current_price:.2f}, Tick: {current_tick}")
-            print(f"  New ticks: [{new_tick_lower}, {new_tick_upper}]")
-            print(f"  New range: [{self.position_min_price:.2f}, {self.position_max_price:.2f}]")
+            reason = "first" if no_position else ("danger" if in_danger_zone else "width_change")
+            print(f"[Rebalance:{reason}] Step {self.current_step}: edge={edge_proximity:.1%}, "
+                  f"tick_width={tick_width}")
+            print(f"  Price: {current_price:.2f}, Range: [{self.position_min_price:.2f}, {self.position_max_price:.2f}]")
 
         # Update tick bounds for fee calculation
         self.tick_lower = new_tick_lower
@@ -1369,6 +1477,263 @@ class UniswapV3LPEnv(gym.Env):
             reward = 0.0
 
         return reward
+
+    def _calculate_reward_reactive(self, fees: float, il_delta: float,
+                                   current_price: float, did_rebalance: bool,
+                                   gas: float) -> float:
+        """
+        Reactive reward function: No volatility prediction, evaluate current state quality.
+
+        핵심 원리:
+        - 미래 변동성 예측 대신 "현재 포지션 상태"를 평가
+        - 중앙 = 좋은 상태 (보상)
+        - 경계 = 위험한 상태 (패널티)
+        - 좁은 범위 + 경계 = 매우 위험 (패널티 증폭)
+
+        모델 학습 효과:
+        - 고변동성 → 가격이 경계에 자주 접근 → 넓은 범위 선호 학습
+        - 저변동성 → 중앙 유지 용이 → 좁은 범위로 수수료 극대화 학습
+
+        Args:
+            fees: Fees earned this step (USD)
+            il_delta: Change in unrealized IL from previous step (USD)
+            current_price: Current market price
+            did_rebalance: Whether a rebalance happened this step
+            gas: Gas cost if rebalancing occurred (USD)
+
+        Returns:
+            Reward value
+        """
+        # Sanitize inputs
+        fees = 0.0 if np.isnan(fees) else fees
+        il_delta = 0.0 if np.isnan(il_delta) else il_delta
+        gas = 0.0 if np.isnan(gas) else gas
+        current_price = self.initial_price if (np.isnan(current_price) or current_price <= 0) else current_price
+
+        # === 1. 범위 계산 ===
+        range_center = (self.position_min_price + self.position_max_price) / 2
+        range_half = (self.position_max_price - self.position_min_price) / 2
+        range_pct = 2 * range_half / current_price if current_price > 0 else 0.2
+
+        # Prevent division by zero
+        if range_half <= 0:
+            range_half = current_price * 0.1
+
+        # === 2. 포지션 품질 (Position Quality) ===
+        # 중앙=1.0, 경계=0.0, 이탈=음수
+        in_range = self.position_min_price <= current_price <= self.position_max_price
+
+        if in_range:
+            distance = abs(current_price - range_center) / range_half
+            position_quality = 1.0 - distance  # 1=중앙, 0=경계
+        else:
+            # 이탈 정도에 비례한 패널티
+            if current_price < self.position_min_price:
+                overshoot = (self.position_min_price - current_price) / range_half
+            else:
+                overshoot = (current_price - self.position_max_price) / range_half
+            position_quality = -min(overshoot, 2.0)  # 최대 -2.0
+
+        # === 3. 수수료 집중도 (Concentration) ===
+        # 좁은 범위 = 높은 집중도 = 수수료 보너스
+        # 기준: ±10% (20% 폭) = 1.0
+        concentration = min(4.0, 0.20 / max(range_pct, 0.05))
+        fee_reward = fees * concentration
+
+        # === 4. 경계 리스크 패널티 (Edge Risk) ===
+        # 경계 근접 × 범위 좁음 = 높은 리스크
+        if position_quality > 0:
+            edge_proximity = 1.0 - position_quality  # 0=중앙, 1=경계
+            # 좁은 범위일수록 경계 리스크 증폭 (이탈 시 손실 크므로)
+            risk_penalty = (edge_proximity ** 2) * concentration * 0.03
+        else:
+            # 이탈 상태: 직접적 패널티
+            risk_penalty = abs(position_quality) * 0.3
+
+        # === 5. IL 패널티 (가중치 낮춤) ===
+        # IL delta는 노이즈가 많으므로 가중치를 낮게 유지
+        il_weight = self.reward_weights.get('il_weight', 0.05)
+        il_penalty = abs(il_delta) * il_weight
+
+        # === 6. 포지션 품질 보너스 ===
+        # 좋은 포지션 유지에 대한 직접적 보상
+        quality_bonus = position_quality * 0.05 if position_quality > 0 else 0
+
+        # === 7. 가스 패널티 ===
+        gas_penalty = gas if did_rebalance else 0.0
+
+        # === 최종 보상 ===
+        reward = fee_reward + quality_bonus - risk_penalty - il_penalty - gas_penalty
+
+        # Clip extreme values
+        reward = np.clip(reward, -10.0, 10.0)
+
+        # Replace NaN reward with 0
+        if np.isnan(reward) or np.isinf(reward):
+            reward = 0.0
+
+        return reward
+
+    def _calculate_reward_excess_return(self, fees: float, current_price: float,
+                                        did_rebalance: bool, gas: float) -> float:
+        """
+        LP vs HODL 초과수익률 기반 보상 함수.
+
+        핵심 원리:
+        - LP 수익률 = (LP가치 + 누적수수료 - 초기투자) / 초기투자
+        - HODL 수익률 = (HODL가치 - 초기투자) / 초기투자
+        - 초과수익률 = LP 수익률 - HODL 수익률
+
+        장점:
+        - 시장 방향성 제거 (상승장/하락장 무관)
+        - LP의 존재 이유 (HODL 대비 수익)를 직접 평가
+        - fees가 IL을 상쇄하는지 자동 반영
+
+        Args:
+            fees: Fees earned this step (USD)
+            current_price: Current market price
+            did_rebalance: Whether a rebalance happened this step
+            gas: Gas cost if rebalancing occurred (USD)
+
+        Returns:
+            Reward value (excess return delta)
+        """
+        # Sanitize inputs
+        fees = 0.0 if np.isnan(fees) else fees
+        gas = 0.0 if np.isnan(gas) else gas
+        current_price = self.initial_price if (np.isnan(current_price) or current_price <= 0) else current_price
+
+        # === 1. HODL 포트폴리오 현재 가치 ===
+        # HODL = 초기 50:50으로 나눈 토큰을 그대로 보유
+        # token0 = stablecoin (가치 불변), token1 = ETH (가격 변동)
+        hodl_value = self.hodl_token0 + (self.hodl_token1 * current_price)
+
+        # === 2. LP 포트폴리오 현재 가치 ===
+        # LP = 현재 포지션 가치 + 누적 수수료 (gas는 이미 position_value에서 차감됨)
+        lp_value = self.current_position_value + self.cumulative_fees
+
+        # === 3. 수익률 계산 ===
+        if self.initial_investment > 0:
+            lp_return = (lp_value - self.initial_investment) / self.initial_investment
+            hodl_return = (hodl_value - self.initial_investment) / self.initial_investment
+            excess_return = lp_return - hodl_return
+        else:
+            excess_return = 0.0
+
+        # === 4. 보상 = 초과수익률의 변화 (delta) ===
+        # 매 스텝 초과수익률의 "변화량"을 보상으로 사용
+        # 초과수익률이 증가하면 양수 보상, 감소하면 음수 보상
+        excess_return_delta = excess_return - self.prev_excess_return
+        self.prev_excess_return = excess_return
+
+        # 스케일링: 수익률 변화를 USD 단위로 변환
+        # 1% 초과수익률 변화 = $100 (투자금 $10,000 기준)
+        reward = excess_return_delta * self.initial_investment
+
+        # === 5. 가스/수수료 처리 ===
+        # 가스: position_value에 이미 반영되어 excess_return에 자동 포함
+        # 수수료: cumulative_fees → lp_value에 이미 반영되어 excess_return에 자동 포함
+        # 추가 보너스/패널티 없음 (이중 계산 방지)
+
+        # Clip extreme values
+        reward = np.clip(reward, -50.0, 50.0)
+
+        # Replace NaN reward with 0
+        if np.isnan(reward) or np.isinf(reward):
+            reward = 0.0
+
+        return reward
+
+    def _calculate_edge_proximity(self, current_price: float) -> float:
+        """
+        Calculate how close the current price is to the position boundary.
+
+        Based on IL graph analysis (docs/il_graph.png):
+        - 0.0 = price at center of range (safest)
+        - 0.7 = 70% threshold where IL accelerates (rebalance point)
+        - 1.0 = price at boundary (maximum IL risk)
+
+        Args:
+            current_price: Current market price
+
+        Returns:
+            Edge proximity (0.0 to 1.0+)
+        """
+        # No position yet
+        if self.position_min_price <= 0 or self.position_max_price <= 0:
+            return 1.0  # Force initial position creation
+
+        # Calculate center and half-range
+        center = (self.position_min_price + self.position_max_price) / 2
+        half_range = (self.position_max_price - self.position_min_price) / 2
+
+        if half_range <= 0:
+            return 1.0
+
+        # Distance from center as ratio of half-range
+        distance = abs(current_price - center)
+        edge_proximity = distance / half_range
+
+        return edge_proximity  # Can be > 1.0 if out of range
+
+    def _get_hodl_value(self, current_price: float) -> float:
+        """현재 가격에서 HODL 포트폴리오 가치 계산"""
+        return self.hodl_token0 + (self.hodl_token1 * current_price)
+
+    def _get_lp_value(self, current_price: float) -> float:
+        """
+        현재 가격에서 LP 포지션 가치 계산.
+
+        LP value = 현재 토큰 × 현재 가격 + 누적 수수료 - 누적 가스비
+
+        토큰 개수는 유동성 L과 현재 가격으로 V3 공식을 사용해 계산.
+        이 방식으로 매 step마다 가격 변동이 LP 가치에 반영됨.
+
+        Args:
+            current_price: 현재 시장 가격
+
+        Returns:
+            LP 포지션 총 가치 (USD)
+        """
+        if self.liquidity <= 0:
+            return self.initial_investment  # 유동성 없으면 초기 투자금 반환
+
+        # 현재 유동성과 가격으로 토큰 수량 계산
+        tokens = get_token_amounts(
+            int(self.liquidity),
+            current_price,
+            self.position_min_price,
+            self.position_max_price,
+            self.pool_config['token0']['decimals'],
+            self.pool_config['token1']['decimals']
+        )
+
+        # LP 포지션 가치 계산
+        # tokens[0] = token0 (WETH) → 가격 곱해서 USD로 변환
+        # tokens[1] = token1 (USDT) → 이미 USD
+        # 가격 = USDT/WETH (예: 3000)
+        if self.invert_price:
+            # token0=WETH, token1=USDT, price=USDT/WETH
+            position_value = (tokens[0] * current_price) + tokens[1]
+        else:
+            # token0=USDT, token1=WETH, price=USDT/WETH
+            position_value = tokens[0] + (tokens[1] * current_price)
+
+        # 총 LP 가치 = 포지션 가치 + 누적 수수료 - 누적 가스비
+        lp_value = position_value + self.cumulative_fees - self.cumulative_gas
+
+        return max(0.0, lp_value)  # 음수 방지
+
+    def _get_excess_return(self, current_price: float) -> float:
+        """현재 LP vs HODL 초과수익률 계산"""
+        hodl_value = self._get_hodl_value(current_price)
+        lp_value = self._get_lp_value(current_price)  # 가격 변동 반영된 LP 가치
+
+        if self.initial_investment > 0:
+            lp_return = (lp_value - self.initial_investment) / self.initial_investment
+            hodl_return = (hodl_value - self.initial_investment) / self.initial_investment
+            return lp_return - hodl_return
+        return 0.0
 
     def _is_position_failed(self, current_price: float) -> bool:
         """

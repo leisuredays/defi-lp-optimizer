@@ -46,6 +46,7 @@ from .adapter import (
 
 # 환경 및 학습
 from .environment import UniswapV3LPEnv
+from .environment_v9 import UniswapV3LPEnvV9  # v9: Excess Return reward
 from .callbacks import RewardLoggingCallback, ProgressCallback
 from .trainer import train
 # from .visualize import create_visualization  # Module not yet implemented

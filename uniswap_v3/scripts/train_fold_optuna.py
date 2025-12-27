@@ -106,18 +106,18 @@ def create_env(data: pd.DataFrame, action_space: list):
 def objective(trial, train_data, total_steps):
     """Optuna objective function - optimize hyperparameters."""
 
-    # 1. Action Space Selection (adjusted for ETH/USDT volatility ~1.16%/hour)
+    # 1. Action Space Selection (adjusted for ETH 24h movement: avg 3.12%, 95th pct 9.25%)
     # tick_width = total ticks, half_width = tick_width // 2
-    # 100 ticks → ±0.5% → ~58% in-range
-    # 200 ticks → ±1.0% → ~78% in-range
-    # 400 ticks → ±2.0% → ~92% in-range
+    # 500 ticks → ±2.5%
+    # 1000 ticks → ±5%
+    # 2000 ticks → ±10%
     action_space_options = [
-        [0, 100, 200],          # Narrow 3-action
-        [0, 100, 200, 400],     # Standard 4-action (default)
-        [0, 200, 400],          # Wide 3-action
-        [0, 100, 200, 300, 400],# Full 5-action
-        [0, 150, 300],          # Medium 3-action
-        [0, 200, 300, 400],     # Wide 4-action
+        [0, 500, 1000],           # Narrow 3-action
+        [0, 500, 1000, 2000],     # Standard 4-action (default)
+        [0, 1000, 2000],          # Wide 3-action
+        [0, 500, 1000, 1500, 2000],# Full 5-action
+        [0, 750, 1500],           # Medium 3-action
+        [0, 1000, 1500, 2000],    # Wide 4-action
     ]
     action_space_idx = trial.suggest_categorical('action_space_idx', list(range(len(action_space_options))))
     action_space = action_space_options[action_space_idx]
