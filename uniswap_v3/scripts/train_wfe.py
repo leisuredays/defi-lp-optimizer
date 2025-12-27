@@ -2,8 +2,14 @@
 Rolling Window Walk-Forward Training with WFE Analysis
 
 Implements Robert Pardo's Walk-Forward Efficiency methodology:
-- Rolling window: 180 days train, 30 days test
+- Rolling window: 300 days train, 100 days test (default)
+- Train:Test ratio = 3:1 (increased training emphasis)
 - WFE = (Out-of-Sample Return) / (In-Sample Return) × 100%
+
+Configuration Options:
+- Default (300/100): 10 folds, 67% overlap, 3:1 ratio
+- Alternative (270/90): 11 folds, 67% overlap, 3:1 ratio
+- Legacy (180/30): 38 folds, 83% overlap - more data points
 
 WFE Interpretation:
 - ≥ 50%: Strategy valid, consider for production
@@ -11,8 +17,9 @@ WFE Interpretation:
 - < 30%: Overfitting, discard
 
 Usage:
-  python train_rolling.py
-  python train_rolling.py --window 180 --test 30
+  python train_wfe.py                         # Default: 300/100
+  python train_wfe.py --window 300 --test 100 # Explicit 300/100
+  python train_wfe.py --window 180 --test 30  # Legacy config
 """
 import sys
 import argparse
@@ -28,7 +35,7 @@ import traceback
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import BaseCallback
 
@@ -147,11 +154,22 @@ def create_env(data: pd.DataFrame, episode_length: int = None):
 
 def train_model(train_data: pd.DataFrame, timesteps: int = 500000,
                 fold_num: int = 1, checkpoint_dir: Path = None,
-                checkpoint_freq: int = 100000) -> PPO:
-    """Train a new PPO model on training data with checkpoints."""
+                checkpoint_freq: int = 100000, version: str = "v1") -> tuple:
+    """Train a new PPO model on training data with checkpoints.
+
+    Returns:
+        tuple: (model, vec_normalize) - trained model and normalization wrapper
+    """
     from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList
 
     env = DummyVecEnv([lambda: create_env(train_data)])
+
+    # Wrap with VecNormalize for reward normalization
+    # norm_obs=True: normalize observations
+    # norm_reward=True: normalize rewards (running mean/std)
+    # clip_obs=10.0: clip normalized observations
+    # gamma=0.99: discount factor for reward normalization
+    env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0, gamma=0.99)
 
     model = PPO(
         policy="MlpPolicy",
@@ -178,7 +196,7 @@ def train_model(train_data: pd.DataFrame, timesteps: int = 500000,
         checkpoint_cb = CheckpointCallback(
             save_freq=checkpoint_freq,
             save_path=str(checkpoint_dir),
-            name_prefix=f"fold_{fold_num:02d}",
+            name_prefix=f"fold_{fold_num:02d}_{version}",
             verbose=1
         )
         callbacks.append(checkpoint_cb)
@@ -192,7 +210,7 @@ def train_model(train_data: pd.DataFrame, timesteps: int = 500000,
         sys.stdout.flush()
         raise
 
-    return model
+    return model, env  # Return both model and VecNormalize wrapper
 
 
 def evaluate_model(model: PPO, data: pd.DataFrame, label: str = "") -> dict:
@@ -297,7 +315,10 @@ def rolling_window_wfe(
     window_days: int = 180,
     test_days: int = 30,
     timesteps_per_fold: int = 500000,
-    output_dir: Path = None
+    output_dir: Path = None,
+    version: str = "v1",
+    start_fold: int = 1,
+    end_fold: int = None
 ) -> list:
     """
     Perform rolling window Walk-Forward Evaluation.
@@ -330,7 +351,21 @@ def rolling_window_wfe(
 
     results = []
 
-    for fold in range(n_folds):
+    # Start from specified fold (1-indexed input, 0-indexed loop)
+    start_idx_fold = start_fold - 1
+
+    # End at specified fold (inclusive)
+    if end_fold is not None:
+        max_fold_idx = min(end_fold, n_folds)
+    else:
+        max_fold_idx = n_folds
+
+    if start_idx_fold > 0:
+        print(f"\n⚠️ Resuming from Fold {start_fold} (skipping Folds 1-{start_fold-1})")
+    if end_fold is not None:
+        print(f"📌 Training Folds {start_fold} to {max_fold_idx}")
+
+    for fold in range(start_idx_fold, max_fold_idx):
         start_idx = fold * test_hours
         train_end = start_idx + window_hours
         test_end = train_end + test_hours
@@ -355,12 +390,13 @@ def rolling_window_wfe(
         print("\n[Training...]")
         sys.stdout.flush()
         checkpoint_dir = output_dir / "checkpoints" if output_dir else None
-        model = train_model(
+        model, vec_normalize = train_model(
             train_data,
             timesteps_per_fold,
             fold_num=fold + 1,
             checkpoint_dir=checkpoint_dir,
-            checkpoint_freq=100000
+            checkpoint_freq=500000,  # Save every 500K steps
+            version=version
         )
 
         # Evaluate on train (in-sample)
@@ -402,9 +438,13 @@ def rolling_window_wfe(
 
         # Save fold model
         if output_dir:
-            model_path = output_dir / "models" / f"fold_{fold+1:02d}.zip"
+            model_path = output_dir / "models" / f"fold_{fold+1:02d}_{version}_{timesteps_per_fold//1000}k.zip"
             model.save(str(model_path))
+            # Save VecNormalize stats for inference
+            vec_norm_path = output_dir / "models" / f"fold_{fold+1:02d}_{version}_{timesteps_per_fold//1000}k_vecnorm.pkl"
+            vec_normalize.save(str(vec_norm_path))
             print(f"  Model saved: models/{model_path.name}")
+            print(f"  VecNormalize saved: models/{vec_norm_path.name}")
             sys.stdout.flush()
 
         # Save intermediate results
@@ -454,9 +494,12 @@ def rolling_window_wfe(
 
 def main():
     parser = argparse.ArgumentParser(description='Rolling Window WFE Training')
-    parser.add_argument('--window', type=int, default=180, help='Training window (days)')
-    parser.add_argument('--test', type=int, default=30, help='Test period (days)')
-    parser.add_argument('--timesteps', type=int, default=500000, help='Timesteps per fold')
+    parser.add_argument('--window', type=int, default=300, help='Training window (days), default: 300')
+    parser.add_argument('--test', type=int, default=100, help='Test period (days), default: 100')
+    parser.add_argument('--timesteps', type=int, default=1000000, help='Timesteps per fold (default: 1M)')
+    parser.add_argument('--version', type=str, default='v5_300_100', help='Version tag for model naming')
+    parser.add_argument('--start-fold', type=int, default=1, help='Start from this fold number (for resuming)')
+    parser.add_argument('--end-fold', type=int, default=None, help='End at this fold number (inclusive)')
     args = parser.parse_args()
 
     # Paths
@@ -475,12 +518,22 @@ def main():
     print(f"Loaded {len(data):,} hours ({len(data)/24:.0f} days)")
 
     # Run rolling window WFE
+    print(f"Version: {args.version}")
+    print(f"Timesteps per fold: {args.timesteps:,}")
+    if args.start_fold > 1:
+        print(f"Starting from fold: {args.start_fold}")
+    if args.end_fold:
+        print(f"Ending at fold: {args.end_fold}")
+
     results = rolling_window_wfe(
         data=data,
         window_days=args.window,
         test_days=args.test,
         timesteps_per_fold=args.timesteps,
-        output_dir=output_dir
+        output_dir=output_dir,
+        version=args.version,
+        start_fold=args.start_fold,
+        end_fold=args.end_fold
     )
 
     # Save results

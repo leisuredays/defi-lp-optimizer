@@ -10,6 +10,13 @@ import pandas as pd
 from typing import Dict, Any, Tuple, Optional
 import math
 
+# TA-Lib for technical indicators (Paper: arXiv:2501.07508)
+try:
+    import talib
+    TALIB_AVAILABLE = True
+except ImportError:
+    TALIB_AVAILABLE = False
+
 # uniswap_v3.math에서 저수준 함수 import
 from ..math import (
     price_to_tick,
@@ -50,12 +57,17 @@ class UniswapV3LPEnv(gym.Env):
         - Position Features (10): ticks, width, distances, in_range, time_since_rebalance, cumulative metrics
         - Forward-Looking (8): predictions, liquidity concentration, growth rates
 
-    Action Space: Continuous [-500, 500] for min/max tick deltas
+    Action Space: Continuous [-1, 1]^3
+        - action[0]: Rebalancing decision (-1=no, +1=yes)
+        - action[1]: Lower range factor (-1=narrow, +1=wide)
+        - action[2]: Upper range factor (-1=narrow, +1=wide)
 
-    Reward: α*fees - β*IL - γ*gas_costs + δ*in_range_bonus - ε*rebalancing_penalty
+    Reward: R = fees - β*LVR (gas removed)
+        - β: LVR weight (default 2.0) - higher = more conservative, minimizes IL indirectly
+        - LVR: Loss-Versus-Rebalancing (arXiv:2208.06046)
+        - Gas removed to focus on core LP economics
 
-    IL/Fee Calculation: Whitepaper formulas (Section 6.3, 6.4.1)
-        - IL: Token amount-based (L = Investment / (2√P₀ - √Pa - P₀/√Pb))
+    Fee Calculation: Whitepaper formulas (Section 6.3, 6.4.1)
         - Fees: feeGrowthGlobal delta × L × active_ratio / Q128
     """
 
@@ -77,7 +89,7 @@ class UniswapV3LPEnv(gym.Env):
             pool_config: Pool configuration with token0, token1, feeTier
             initial_investment: Starting capital (USD)
             episode_length_hours: Episode duration in hours (default: 30 days = 720 hours)
-            reward_weights: Dict with α, β, γ, δ, ε for reward function tuning
+            reward_weights: Dict with 'lvr_weight' (β) for LVR penalty tuning (default: 1.0)
             obs_dim: Observation dimension (24 or 28). Use 24 for models trained before v3.
             debug: Enable debug logging for rebalancing decisions
             invert_price: If True, invert prices (token0 is stablecoin case)
@@ -93,13 +105,11 @@ class UniswapV3LPEnv(gym.Env):
         self.initial_investment = initial_investment
         self.episode_length = episode_length_hours
 
-        # Reward function weights
-        # reward = α*fees - β*IL - γ*gas
-        # Equal weights for pure profit maximization (Fees - IL - Gas)
+        # Reward function weights (Paper: arXiv:2501.07508)
+        # reward = fees - β*LVR (gas excluded to avoid saturation)
+        # β=1.0 per paper: treats LVR as true opportunity cost
         self.reward_weights = reward_weights or {
-            'alpha': 1.0,    # Fees coefficient
-            'beta': 1.0,     # IL coefficient (equal weight)
-            'gamma': 1.0     # Gas costs coefficient (equal weight)
+            'lvr_weight': 1.0,    # LVR coefficient (β) - paper uses 1.0
         }
 
         # Protocol ID to name mapping
@@ -113,9 +123,9 @@ class UniswapV3LPEnv(gym.Env):
         }
 
         # Gas cost estimates by protocol (in USD)
-        # Lowered to $10 for Ethereum to encourage more rebalancing
+        # Paper (arXiv:2501.07508): $5 based on Etherscan gas tracker
         self.gas_costs = {
-            'ethereum': 10,
+            'ethereum': 5,
             'polygon': 1,
             'arbitrum': 1,
             'optimism': 1,
@@ -129,22 +139,21 @@ class UniswapV3LPEnv(gym.Env):
         else:
             self.protocol = protocol_raw
 
-        # Action space: [should_rebalance, min_range_factor, max_range_factor]
-        # 3D action space - model learns WHEN and WHERE to rebalance
-        # action[0]: Rebalancing decision (-1=no, +1=yes)
-        # action[1]: Lower range factor (-1=narrow, +1=wide)
-        # action[2]: Upper range factor (-1=narrow, +1=wide)
-        self.action_space = spaces.Box(
-            low=np.array([-1, -1, -1], dtype=np.float32),
-            high=np.array([1, 1, 1], dtype=np.float32),
-            dtype=np.float32
-        )
+        # Action space: Discrete (Paper: arXiv:2501.07508, Table 1)
+        # action=0: No rebalance (keep current position)
+        # action=1,2: Rebalance with tick width = TICK_WIDTH_OPTIONS[action]
+        # Tick width determines symmetric range around current price
+        # Paper uses [0, 20, 50] for first window (2022-05-14)
+        self.TICK_WIDTH_OPTIONS = [0, 20, 50]  # 0=no rebalance
+        self.action_space = spaces.Discrete(len(self.TICK_WIDTH_OPTIONS))
 
-        # Observation space: configurable dimensions (24 or 28) for model compatibility
+        # Observation space: 11 dimensions (Paper: arXiv:2501.07508)
+        # [price, tick, width, liquidity, volatility, ma_24, ma_168, BB, ADXR, BOP, DX]
+        self.obs_dim = 11  # Override any passed value
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(self.obs_dim,),
+            shape=(11,),
             dtype=np.float32
         )
 
@@ -198,9 +207,45 @@ class UniswapV3LPEnv(gym.Env):
 
         # Price features
         df['returns'] = df['close'].pct_change()
-        df['volatility_24h'] = df['returns'].rolling(24).std()
+        # Paper (arXiv:2501.07508): Exponentially weighted volatility with α=0.05
+        df['ewma_volatility'] = df['returns'].ewm(alpha=0.05).std()
+        df['volatility_24h'] = df['ewma_volatility']  # Alias for backward compatibility
         df['momentum_1h'] = df['close'].pct_change(1)
         df['momentum_24h'] = df['close'].pct_change(24)
+
+        # Paper (arXiv:2501.07508): Moving averages for state space
+        df['ma_24h'] = df['close'].rolling(24).mean()
+        df['ma_168h'] = df['close'].rolling(168).mean()  # 1 week = 168 hours
+
+        # Technical indicators (Paper: arXiv:2501.07508, Section 5)
+        # Uses TA-Lib: BB, ADXR, BOP, DX
+        if TALIB_AVAILABLE and 'high' in df.columns and 'low' in df.columns:
+            close = df['close'].values
+            high = df['high'].values
+            low = df['low'].values
+            open_price = df.get('open', df['close']).values
+
+            # Bollinger Bands - calculate position within bands (0-1)
+            upper, middle, lower = talib.BBANDS(close, timeperiod=20, nbdevup=2, nbdevdn=2)
+            # Position: 0 = at lower band, 0.5 = at middle, 1 = at upper band
+            band_width = upper - lower
+            df['bb_position'] = np.where(band_width > 0, (close - lower) / band_width, 0.5)
+            df['bb_position'] = df['bb_position'].clip(0, 1)
+
+            # ADXR - Average Directional Movement Index Rating (trend strength)
+            df['adxr'] = talib.ADXR(high, low, close, timeperiod=14)
+
+            # BOP - Balance of Power (-1 to +1)
+            df['bop'] = talib.BOP(open_price, high, low, close)
+
+            # DX - Directional Movement Index (trend direction)
+            df['dx'] = talib.DX(high, low, close, timeperiod=14)
+        else:
+            # Fallback values if TA-Lib not available
+            df['bb_position'] = 0.5
+            df['adxr'] = 25.0
+            df['bop'] = 0.0
+            df['dx'] = 25.0
 
         # Volume/TVL features (if available)
         if 'volume' in df.columns:
@@ -672,198 +717,115 @@ class UniswapV3LPEnv(gym.Env):
         truncated = time_limit_reached and not position_failed  # Episode cut short by time limit
 
         # Info dict
+        lvr_weight = self.reward_weights.get('lvr_weight', 1.0)
         info = {
             'fees': fees_earned,
             'lvr': lvr,  # LVR penalty this step
+            'lvr_weight': lvr_weight,  # LVR weight (β) for debugging
             'il': il_incurred,  # Keep IL for backward compat
             'realized_il': self.cumulative_il,  # Total IL realized through rebalancing
             'unrealized_il': self.unrealized_il,  # Current unrealized IL
             'cumulative_lvr': self.cumulative_lvr,  # Total LVR accumulated
             'volatility': returns_volatility,  # Returns volatility σ (for debugging)
-            'gas': total_gas_cost,  # Includes base gas + swap cost
+            'gas': total_gas_cost,  # Includes base gas + swap cost (tracked, not in reward)
             'swap_cost': swap_cost,  # Swap cost only (for debugging)
             'rebalanced': did_rebalance,
             'total_rebalances': self.total_rebalances,
             'cumulative_fees': self.cumulative_fees,
             'cumulative_il': self.cumulative_il,  # Keep for backward compat
             'cumulative_gas': self.cumulative_gas,
-            'net_return': self.cumulative_fees - self.cumulative_lvr - self.cumulative_gas,  # Use LVR
+            'net_return': self.cumulative_fees - self.cumulative_lvr - self.cumulative_gas,  # Actual P&L
+            # reward_net_return = cumulative(fees - β*LVR) - gas excluded from reward
+            'reward_net_return': self.cumulative_fees - lvr_weight * self.cumulative_lvr,
             'current_position_value': self.current_position_value,  # Actual portfolio value
             'in_range': self.tick_lower <= int(current_data.get('tick', 0)) <= self.tick_upper
         }
 
         return self._get_observation(), reward, terminated, truncated, info
 
-    def _apply_action(self, action: np.ndarray, debug: bool = False) -> bool:
+    def _apply_action(self, action: int, debug: bool = False) -> bool:
         """
-        Apply action to adjust position ranges using VOLATILITY-BASED scaling.
+        Apply discrete action to adjust position ranges (Paper: arXiv:2501.07508).
 
-        **3D Action Space** - Model learns WHEN and WHERE to rebalance:
-        - action[0]: should_rebalance (-1=no, +1=yes)
-        - action[1]: min_range_factor (-1=narrow 0.5σ, +1=wide 5.0σ)
-        - action[2]: max_range_factor (-1=narrow 0.5σ, +1=wide 5.0σ)
+        **Discrete Action Space**:
+        - action=0: No rebalance (keep current position)
+        - action=1,2,3,4,5: Rebalance with tick width = TICK_WIDTH_OPTIONS[action]
 
-        Rebalancing decision flow:
-        1. Emergency: Out of range → FORCE rebalance (safety override)
-        2. Cooldown: <24h since last → BLOCK rebalance (cost control)
-        3. Model: action[0] > 0 → Allow if change ≥2%
+        The tick width determines symmetric price range centered around current price.
+        Example: tick_width=20 with tick_spacing=10 → range spans 2 ticks above/below.
 
         Args:
-            action: [should_rebalance, min_range_factor, max_range_factor]
+            action: Integer action index (0 to len(TICK_WIDTH_OPTIONS)-1)
             debug: If True, print debug information
 
         Returns:
             True if position was rebalanced
         """
-        # Calculate current volatility (recent price std dev)
+        # Get tick width from action
+        tick_width = self.TICK_WIDTH_OPTIONS[action]
+
+        # action=0 means no rebalancing
+        if tick_width == 0:
+            if debug:
+                print(f"[Rebalance] Step {self.current_step}: action=0, no rebalance")
+            return False
+
+        # Get current price and tick
         current_idx = self.episode_start_idx + self.current_step
-
-        # Use recent 24-hour window for volatility
-        lookback = min(24, current_idx)
-        if lookback < 2:
-            lookback = 2
-
-        recent_prices = self.features_df.iloc[current_idx-lookback:current_idx+1]['close'].values
-        volatility = np.std(recent_prices)
         current_price = self.features_df.iloc[current_idx]['close']
 
-        # Handle edge cases
-        if volatility <= 0 or np.isnan(volatility):
-            volatility = current_price * 0.05  # Default to 5% volatility
         if current_price <= 0 or np.isnan(current_price):
-            return False  # Invalid price
+            return False
 
-        # Extract rebalancing decision and range factors from 3D action
-        should_rebalance_raw = action[0]  # -1 (no) to +1 (yes)
-        min_range_factor = action[1]      # -1 (narrow) to +1 (wide)
-        max_range_factor = action[2]      # -1 (narrow) to +1 (wide)
-
-        # Map range factors [-1, 1] to volatility multiplier [0.5, 5.0]
-        # factor = -1 → multiplier = 0.5σ (narrow)
-        # factor =  0 → multiplier = 2.75σ (medium)
-        # factor = +1 → multiplier = 5.0σ (wide)
-        min_multiplier = 0.5 + (min_range_factor + 1) / 2 * 4.5
-        max_multiplier = 0.5 + (max_range_factor + 1) / 2 * 4.5
-
-        # Calculate new ranges
-        new_min = current_price - (volatility * min_multiplier)
-        new_max = current_price + (volatility * max_multiplier)
-
-        # Safety bounds
-        if new_min <= 0:
-            new_min = current_price * 0.1  # At least 10% of current price
-        if new_max <= new_min:
-            new_max = new_min * 1.5  # Ensure valid range
-
-        # Ensure range is not absurdly far from current price
-        if new_max > current_price * 10 or new_min < current_price * 0.1:
-            return False  # Range too extreme
-
-        # Round to valid ticks
+        # Get tick spacing for this fee tier
         fee_tier = self.pool_config['feeTier']
-        new_min = round_to_nearest_tick(
-            new_min,
-            fee_tier,
-            self.pool_config['token0']['decimals'],
-            self.pool_config['token1']['decimals']
-        )
-        new_max = round_to_nearest_tick(
-            new_max,
-            fee_tier,
-            self.pool_config['token0']['decimals'],
-            self.pool_config['token1']['decimals']
-        )
+        tick_spacing = TICK_SPACINGS.get(fee_tier, 60)
 
-        # ===================================================================
-        # MINIMUM RANGE WIDTH ENFORCEMENT
-        # Prevent 0-width or too narrow positions that can't earn fees
-        # ===================================================================
-        MIN_RANGE_WIDTH_PCT = 0.16  # Minimum 16% width (±8%)
+        # Calculate current tick from price
+        token0_decimals = self.pool_config['token0']['decimals']
+        token1_decimals = self.pool_config['token1']['decimals']
 
-        range_width = (new_max - new_min) / current_price if current_price > 0 else 0
+        if self.invert_price:
+            current_tick = price_to_tick(current_price, token0_decimals, token1_decimals)
+        else:
+            current_tick = price_to_tick(1.0 / current_price, token0_decimals, token1_decimals)
 
-        if range_width < MIN_RANGE_WIDTH_PCT:
-            # Expand range symmetrically to meet minimum width
-            half_width = current_price * MIN_RANGE_WIDTH_PCT / 2
-            new_min = current_price - half_width
-            new_max = current_price + half_width
+        # Calculate new tick bounds: symmetric around current tick
+        # tick_width is in units of tick_spacing
+        half_width_ticks = tick_width * tick_spacing // 2
+        new_tick_lower = current_tick - half_width_ticks
+        new_tick_upper = current_tick + half_width_ticks
 
-            # Re-round to valid ticks after expansion
-            new_min = round_to_nearest_tick(
-                new_min,
-                fee_tier,
-                self.pool_config['token0']['decimals'],
-                self.pool_config['token1']['decimals']
-            )
-            new_max = round_to_nearest_tick(
-                new_max,
-                fee_tier,
-                self.pool_config['token0']['decimals'],
-                self.pool_config['token1']['decimals']
-            )
+        # Snap to valid tick spacing
+        new_tick_lower = (new_tick_lower // tick_spacing) * tick_spacing
+        new_tick_upper = (new_tick_upper // tick_spacing) * tick_spacing
 
-            if self.debug:
-                print(f"  [MIN_WIDTH] Expanded range to {MIN_RANGE_WIDTH_PCT*100:.1f}%: "
-                      f"[{new_min:.4f}, {new_max:.4f}]")
+        # Ensure minimum width
+        if new_tick_upper <= new_tick_lower:
+            new_tick_upper = new_tick_lower + tick_spacing
 
-        # ===================================================================
-        # REBALANCING LOGIC: Full Model Autonomy
-        # No forced rebalancing, no cooldown - model has full control
-        # ===================================================================
+        # Convert ticks back to prices
+        new_min = tick_to_price(new_tick_lower, token0_decimals, token1_decimals)
+        new_max = tick_to_price(new_tick_upper, token0_decimals, token1_decimals)
 
-        # Check if price is out of range (informational only, no forced action)
-        is_out_of_range = (current_price < self.position_min_price) or (current_price > self.position_max_price)
-
-        # Debug logging
-        if debug:
-            print(f"[Rebalance Debug] Step {self.current_step}:")
-            print(f"  Price: {current_price:.8f}, Range: [{self.position_min_price:.8f}, {self.position_max_price:.8f}]")
-            print(f"  Out of range: {is_out_of_range}, Time since rebalance: {self.time_since_last_rebalance}h")
-            print(f"  Model action[0]: {should_rebalance_raw:.4f} (> 0 = wants rebalance)")
-
-        # MODEL DECISION: Let AI decide based on learned cost-benefit analysis
-        # No forced rebalancing, no cooldown - model has full autonomy
-        model_wants_rebalance = should_rebalance_raw > 0
-
-        if not model_wants_rebalance:
-            if debug:
-                print(f"  → BLOCKED: Model says no (action[0]={should_rebalance_raw:.4f})")
-            return False
-
-        # Validate range change is meaningful (physical constraint, not policy)
-        old_width = self.position_max_price - self.position_min_price
-        new_width = new_max - new_min
-
-        if old_width <= 0:
-            if debug:
-                print(f"  → BLOCKED: Invalid old range (width={old_width})")
-            return False
-
-        # Calculate change percentages
-        width_change_pct = abs(new_width - old_width) / old_width
-        old_center = (self.position_min_price + self.position_max_price) / 2
-        new_center = (new_min + new_max) / 2
-        center_shift_pct = abs(new_center - old_center) / old_width
-
-        # Physical constraint: ignore if change too small (<2%)
-        # This prevents wasting gas on micro-adjustments
-        if width_change_pct < 0.02 and center_shift_pct < 0.02:
-            if debug:
-                print(f"  → BLOCKED: Change too small (width: {width_change_pct:.2%}, center: {center_shift_pct:.2%})")
-            return False
+        # If using inverted prices (token1/token0 like USDT/WETH), swap min/max
+        if self.invert_price:
+            self.position_min_price = new_min
+            self.position_max_price = new_max
+        else:
+            # Invert back to token0/token1 format
+            self.position_min_price = 1.0 / new_max if new_max > 0 else 0
+            self.position_max_price = 1.0 / new_min if new_min > 0 else 0
 
         if debug:
-            print(f"  → ALLOWED: Model rebalance (width Δ: {width_change_pct:.2%}, center Δ: {center_shift_pct:.2%})")
-
-        # Apply new ranges
-        self.position_min_price = new_min
-        self.position_max_price = new_max
-
-        if debug:
-            print(f"  ✓ REBALANCED: New range [{new_min:.8f}, {new_max:.8f}]")
+            print(f"[Rebalance] Step {self.current_step}: action={action}, tick_width={tick_width}")
+            print(f"  Price: {current_price:.2f}, Tick: {current_tick}")
+            print(f"  New ticks: [{new_tick_lower}, {new_tick_upper}]")
+            print(f"  New range: [{self.position_min_price:.2f}, {self.position_max_price:.2f}]")
 
         # Update tick bounds for fee calculation
-        self._update_tick_bounds()
+        self.tick_lower = new_tick_lower
+        self.tick_upper = new_tick_upper
 
         # Update backtest-compatible liquidity
         self._update_backtest_L()
@@ -1280,30 +1242,26 @@ class UniswapV3LPEnv(gym.Env):
     def _calculate_reward(self, fees: float, lvr: float, gas: float,
                          did_rebalance: bool, current_data: pd.Series) -> float:
         """
-        Calculate reward using LVR-based formula from paper.
+        Calculate reward using paper formula (arXiv:2501.07508, Eq. 17).
 
-        Paper: arXiv:2501.07508
-        R_{t+1} = f_t - ℓ_t(σ,p) - I[a_t ≠ 0] × g
+        Formula:
+        R = fees - LVR - I[rebalance] * gas
 
         Where:
-        - f_t: trading fees earned
-        - ℓ_t(σ,p): LVR penalty (applied every step)
-        - g: gas fee (only when rebalancing)
-
-        Key differences from previous IL-based approach:
-        - LVR is applied EVERY step (not just on rebalancing)
-        - LVR is volatility-based (encourages wider ranges in volatile markets)
-        - Simpler formula without separate α, β, γ coefficients
+        - fees: trading fees earned this step
+        - LVR: Loss-Versus-Rebalancing penalty (opportunity cost)
+        - gas: $5 per rebalance (only when action != 0)
+        - I[rebalance]: indicator function (1 if rebalanced, 0 otherwise)
 
         Args:
             fees: Fees earned this step
-            lvr: LVR penalty this step (applied every step)
-            gas: Gas cost (only if rebalanced)
+            lvr: LVR penalty this step
+            gas: Gas cost for rebalancing
             did_rebalance: Whether rebalancing occurred
             current_data: Current market data
 
         Returns:
-            Reward value (bounded by tanh)
+            Reward value
         """
         # Replace any NaN inputs with 0
         fees = 0.0 if np.isnan(fees) else fees
@@ -1311,24 +1269,22 @@ class UniswapV3LPEnv(gym.Env):
         gas = 0.0 if np.isnan(gas) else gas
 
         # =================================================================
-        # PAPER-BASED REWARD: R = fees - LVR - gas
-        # arXiv:2501.07508
+        # PAPER FORMULA (Eq. 17): R = fees - LVR - I[a≠0] * gas
+        # arXiv:2501.07508 - Deep Reinforcement Learning for Uniswap V3
+        # Gas ($5) only charged when rebalancing occurs
         # =================================================================
-        # Key: LVR is applied every step (volatility-based penalty)
-        # Gas is only applied when rebalancing (I[a_t ≠ 0] × g)
-        reward = fees - lvr - gas
+        lvr_weight = self.reward_weights.get('lvr_weight', 1.0)
+
+        # Gas only applies when rebalancing
+        gas_penalty = gas if did_rebalance else 0.0
+
+        reward = fees - lvr_weight * lvr - gas_penalty
 
         # Replace NaN reward with 0
         if np.isnan(reward) or np.isinf(reward):
             reward = 0.0
 
-        # Rescale reward using tanh for bounded output (-1, 1)
-        # Scale factor adjusted for typical hourly fees ($1-5)
-        # $10 change = tanh(1.0) ≈ 0.76 (provides good gradient)
-        reward_scaled = reward / 10.0
-        reward_bounded = np.tanh(reward_scaled)
-
-        return reward_bounded
+        return reward
 
     def _is_position_failed(self, current_price: float) -> bool:
         """
@@ -1424,71 +1380,77 @@ class UniswapV3LPEnv(gym.Env):
     def _get_observation(self) -> np.ndarray:
         """
         Extract state vector from current environment state.
-        Supports both 24-dim (legacy) and 28-dim (current) observations.
+        Paper-style observation (arXiv:2501.07508, Section 5).
+
+        State Space:
+        1. Market price p_t (normalized)
+        2. Tick index i (normalized)
+        3. Interval width w_t (current tick width / tick_spacing)
+        4. Current liquidity level L_t (normalized)
+        5. Exponentially weighted volatility σ_t
+        6. 24-hour moving average
+        7. 168-hour moving average
+        8-11. Technical indicators: BB, ADXR, BOP, DX
 
         Returns:
-            numpy array with obs_dim features (normalized)
+            numpy array with 11 features
         """
         current_idx = self.episode_start_idx + self.current_step
         current_data = self.features_df.iloc[current_idx]
         current_price = current_data['close']
 
-        # Market features (10)
-        f1 = current_price / self.initial_price  # Normalized price
-        f2 = current_data['volatility_24h'] / current_price  # Relative volatility
-        f3 = current_data['momentum_1h']
-        f4 = current_data['momentum_24h']
-        f5 = np.log1p(float(current_data.get('tvl', 1000000))) / 20  # Log-normalized TVL
-        f6 = np.log1p(float(current_data.get('volume_24h', 10000))) / 15  # Log-normalized volume
-        f7 = float(current_data.get('liquidity', 1000000)) / 1e6  # Liquidity depth
-        f8 = self.pool_config['feeTier'] / 10000  # Fee tier (0.05, 0.30, 1.0)
-        f9 = current_data['hour_sin']
-        f10 = current_data['day_sin']
+        # Get tick spacing
+        fee_tier = self.pool_config['feeTier']
+        tick_spacing = TICK_SPACINGS.get(fee_tier, 60)
 
-        # Position features (10)
-        min_tick = get_tick_from_price(self.position_min_price, self.pool_config, 0)
-        max_tick = get_tick_from_price(self.position_max_price, self.pool_config, 0)
-        current_tick = get_tick_from_price(current_price, self.pool_config, 0)
+        # 1. Market price (normalized by initial price)
+        f1 = current_price / self.initial_price if self.initial_price > 0 else 1.0
 
-        f11 = (min_tick - current_tick) / 10000  # Normalized distance to min
-        f12 = (max_tick - current_tick) / 10000  # Normalized distance to max
-        f13 = (max_tick - min_tick) / 10000  # Position width
-        f14 = 1.0 if self.position_min_price < current_price < self.position_max_price else 0.0
-        f15 = self.time_since_last_rebalance / 168  # Normalized (1 week = 168 hours)
-        f16 = self.cumulative_fees / self.initial_investment
-        f17 = self.cumulative_il / self.initial_investment
-        f18 = self.cumulative_gas / self.initial_investment
-        f19 = self.total_rebalances / 30  # Normalized (30 rebalances = 1.0)
-        f20 = self.current_step / self.episode_length  # Episode progress
-
-        # Forward-looking features (4 for 24-dim, 8 for 28-dim)
-        f21 = current_data.get('momentum_1h', 0)  # Predicted price 1h (use momentum)
-        f22 = current_data.get('momentum_24h', 0)  # Predicted price 24h
-        f23 = current_data['volatility_24h'] / current_price  # Predicted vol 1h
-        f24 = current_data['volatility_24h'] / current_price  # Predicted vol 24h
-
-        if self.obs_dim == 24:
-            # 24-dim: Market(10) + Position(10) + Forward(4)
-            obs = np.array([
-                f1, f2, f3, f4, f5, f6, f7, f8, f9, f10,
-                f11, f12, f13, f14, f15, f16, f17, f18, f19, f20,
-                f21, f22, f23, f24
-            ], dtype=np.float32)
+        # 2. Tick index (normalized)
+        token0_dec = self.pool_config['token0']['decimals']
+        token1_dec = self.pool_config['token1']['decimals']
+        if self.invert_price:
+            current_tick = price_to_tick(current_price, token0_dec, token1_dec)
         else:
-            # 28-dim: HMM regime features (replaces placeholders)
-            regime_proba, regime_momentum = self._get_regime_features()
-            f25 = regime_proba[0]  # P(low volatility regime)
-            f26 = regime_proba[1]  # P(high volatility regime)
-            f27 = regime_momentum[0]  # Low vol regime transition speed
-            f28 = regime_momentum[1]  # High vol regime transition speed
+            current_tick = price_to_tick(1.0 / current_price, token0_dec, token1_dec) if current_price > 0 else 0
+        f2 = current_tick / 100000  # Normalize tick index
 
-            obs = np.array([
-                f1, f2, f3, f4, f5, f6, f7, f8, f9, f10,
-                f11, f12, f13, f14, f15, f16, f17, f18, f19, f20,
-                f21, f22, f23, f24, f25, f26, f27, f28
-            ], dtype=np.float32)
+        # 3. Interval width (current width in tick_spacing units)
+        interval_width = (self.tick_upper - self.tick_lower) / tick_spacing if tick_spacing > 0 else 0
+        f3 = interval_width / 100  # Normalize (100 tick_spacings = 1.0)
 
-        # Replace NaN and inf values with 0 (critical for stable training)
+        # 4. Current liquidity level (normalized)
+        f4 = np.log1p(self.backtest_L) / 50 if hasattr(self, 'backtest_L') and self.backtest_L > 0 else 0
+
+        # 5. Exponentially weighted volatility (α=0.05 in paper)
+        # Use pre-calculated volatility from features
+        volatility = current_data.get('volatility_24h', current_price * 0.02)
+        f5 = volatility / current_price if current_price > 0 else 0.02
+
+        # 6. 24-hour moving average (normalized)
+        ma_24 = current_data.get('ma_24h', current_price)
+        f6 = ma_24 / current_price if current_price > 0 else 1.0
+
+        # 7. 168-hour (1 week) moving average (normalized)
+        ma_168 = current_data.get('ma_168h', current_price)
+        f7 = ma_168 / current_price if current_price > 0 else 1.0
+
+        # 8-11. Technical indicators (use momentum as proxy if not available)
+        # BB (Bollinger Bands) - price relative to bands
+        f8 = current_data.get('bb_position', 0.5)  # 0-1, 0.5 = middle
+
+        # ADXR (Average Directional Movement Index Rating) - trend strength
+        f9 = current_data.get('adxr', 25) / 100  # Normalize to 0-1
+
+        # BOP (Balance of Power)
+        f10 = current_data.get('bop', 0)  # -1 to +1
+
+        # DX (Directional Movement Index)
+        f11 = current_data.get('dx', 25) / 100  # Normalize to 0-1
+
+        obs = np.array([f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11], dtype=np.float32)
+
+        # Replace NaN and inf values
         obs = np.nan_to_num(obs, nan=0.0, posinf=10.0, neginf=-10.0)
 
         # Clip to reasonable bounds
