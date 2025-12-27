@@ -139,16 +139,26 @@ class UniswapV3LPEnv(gym.Env):
         else:
             self.protocol = protocol_raw
 
-        # Action space: Discrete - ALL actions require a position
-        # NO "no position" option - model MUST choose a range
-        # Tick width = total ticks in range (half_width = tick_width // 2)
-        # 1 tick ≈ 0.01% price change
-        #   500 ticks   → ±2.5%  (very narrow, high fee concentration)
-        #   1000 ticks  → ±5%    (narrow)
-        #   2000 ticks  → ±10%   (medium)
-        #   4000 ticks  → ±20%   (wide)
-        self.TICK_WIDTH_OPTIONS = [500, 1000, 2000, 4000]  # 4 actions, all with positions
-        self.action_space = spaces.Discrete(len(self.TICK_WIDTH_OPTIONS))
+        # Action space: Continuous (Box) - 3D Action Space
+        # action[0] = lower_pct: 하한선 (현재가 - X%), 범위 1%~99%
+        # action[1] = upper_pct: 상한선 (현재가 + Y%), 범위 1%~500%
+        # action[2] = rebalance_signal: 리밸런싱 신호 (0~1)
+        #             > 0.5: 즉시 리밸런싱 실행
+        #             < 0.5: auto-rebalancing 로직 따름
+        #
+        # LP 특성:
+        # - 하한선: 가격 > 0 이어야 함 → 최대 99%까지만 가능
+        # - 상한선: 이론상 무한대, 실용적으로 500% (5배) 이상은 full range
+        # - 예: [0.10, 0.30, 0.7] → 현재가 -10% ~ +30% 범위, 즉시 리밸런싱
+        self.action_space = spaces.Box(
+            low=np.array([0.01, 0.01, 0.0], dtype=np.float32),
+            high=np.array([0.99, 5.00, 1.0], dtype=np.float32),
+            dtype=np.float32
+        )
+        # Store desired bounds for auto-rebalancing logic
+        self.desired_lower_pct = 0.10  # Default 10%
+        self.desired_upper_pct = 0.10  # Default 10%
+        self.rebalance_signal = 0.0    # Model's rebalancing urgency
 
         # Observation space: 11 dimensions (Paper: arXiv:2501.07508)
         # [price, tick, width, liquidity, volatility, ma_24, ma_168, BB, ADXR, BOP, DX]
@@ -188,8 +198,9 @@ class UniswapV3LPEnv(gym.Env):
 
         # Auto-rebalancing based on IL graph analysis (70% threshold)
         # See docs/il_graph.png - Position Quality vs IL Risk
-        self.desired_tick_width = self.TICK_WIDTH_OPTIONS[0]  # Model's chosen tick width
-        self.current_tick_width = 0  # Current position's tick width
+        # Continuous action space: [lower_pct, upper_pct]
+        self.current_lower_pct = 0.10  # Current position's lower bound %
+        self.current_upper_pct = 0.10  # Current position's upper bound %
         self.rebalance_threshold = 0.70  # 70% edge proximity triggers rebalance
 
         # Fee growth tracking (backtest-accurate fee calculation)
@@ -227,16 +238,8 @@ class UniswapV3LPEnv(gym.Env):
         # Paper (arXiv:2501.07508): Exponentially weighted volatility with α=0.05
         df['ewma_volatility'] = df['returns'].ewm(alpha=0.05).std()
         df['volatility_24h'] = df['ewma_volatility']  # Alias for backward compatibility
-
-        # Multi-scale volatility (rolling std of returns)
-        df['volatility_72h'] = df['returns'].rolling(72).std()   # 3 days
-        df['volatility_168h'] = df['returns'].rolling(168).std()  # 1 week
-
-        # Multi-scale momentum (price change over different horizons)
         df['momentum_1h'] = df['close'].pct_change(1)
-        df['momentum_24h'] = df['close'].pct_change(24)    # 1 day
-        df['momentum_72h'] = df['close'].pct_change(72)    # 3 days
-        df['momentum_168h'] = df['close'].pct_change(168)  # 1 week
+        df['momentum_24h'] = df['close'].pct_change(24)
 
         # Paper (arXiv:2501.07508): Moving averages for state space
         df['ma_24h'] = df['close'].rolling(24).mean()
@@ -366,26 +369,36 @@ class UniswapV3LPEnv(gym.Env):
         self.initial_price = current_data['close']
         volatility = current_data['volatility_24h']
 
-        # Initialize with default tick_width (medium range: ±10%)
+        # Initialize with default range: ±10% (symmetric)
         # Model can change this via action, triggering rebalance if needed
-        default_tick_width = 2000  # ±10% range
-        self.current_tick_width = default_tick_width
-        self.desired_tick_width = default_tick_width
+        default_lower_pct = 0.10  # -10% from current price
+        default_upper_pct = 0.10  # +10% from current price
+        self.current_lower_pct = default_lower_pct
+        self.current_upper_pct = default_upper_pct
+        self.desired_lower_pct = default_lower_pct
+        self.desired_upper_pct = default_upper_pct
 
-        # Calculate position from tick_width
+        # Calculate position from percentage bounds
         fee_tier = self.pool_config['feeTier']
         tick_spacing = TICK_SPACINGS.get(fee_tier, 60)
         token0_decimals = self.pool_config['token0']['decimals']
         token1_decimals = self.pool_config['token1']['decimals']
 
-        if self.invert_price:
-            current_tick = price_to_tick(self.initial_price, token0_decimals, token1_decimals)
-        else:
-            current_tick = price_to_tick(1.0 / self.initial_price, token0_decimals, token1_decimals)
+        # Calculate price bounds from percentages
+        price_lower = self.initial_price * (1.0 - default_lower_pct)
+        price_upper = self.initial_price * (1.0 + default_upper_pct)
 
-        half_width = default_tick_width // 2
-        tick_lower = ((current_tick - half_width) // tick_spacing) * tick_spacing
-        tick_upper = ((current_tick + half_width) // tick_spacing) * tick_spacing
+        # Convert prices to ticks
+        if self.invert_price:
+            tick_lower = price_to_tick(price_lower, token0_decimals, token1_decimals)
+            tick_upper = price_to_tick(price_upper, token0_decimals, token1_decimals)
+        else:
+            tick_lower = price_to_tick(1.0 / price_upper, token0_decimals, token1_decimals)
+            tick_upper = price_to_tick(1.0 / price_lower, token0_decimals, token1_decimals)
+
+        # Snap to valid tick spacing
+        tick_lower = (tick_lower // tick_spacing) * tick_spacing
+        tick_upper = (tick_upper // tick_spacing) * tick_spacing
 
         if tick_upper <= tick_lower:
             tick_upper = tick_lower + tick_spacing
@@ -841,10 +854,13 @@ class UniswapV3LPEnv(gym.Env):
             'hodl_value': self._get_hodl_value(current_data['close']),
             'lp_value': self._get_lp_value(current_data['close']),  # 토큰 가격 반영된 LP 가치
             'excess_return': self._get_excess_return(current_data['close']),  # LP - HODL 수익률
-            # Auto-rebalancing metrics
+            # Auto-rebalancing metrics (3D action space)
             'edge_proximity': self._calculate_edge_proximity(current_data['close']),
-            'current_tick_width': self.current_tick_width,
-            'desired_tick_width': self.desired_tick_width,
+            'current_lower_pct': self.current_lower_pct,
+            'current_upper_pct': self.current_upper_pct,
+            'desired_lower_pct': self.desired_lower_pct,
+            'desired_upper_pct': self.desired_upper_pct,
+            'rebalance_signal': self.rebalance_signal,
             # Price info for visualization
             'current_price': current_data['close'],
             'position_min_price': self.position_min_price,
@@ -853,30 +869,41 @@ class UniswapV3LPEnv(gym.Env):
 
         return self._get_observation(), reward, terminated, truncated, info
 
-    def _apply_action(self, action: int, debug: bool = False) -> bool:
+    def _apply_action(self, action: np.ndarray, debug: bool = False) -> bool:
         """
-        Apply discrete action with AUTO-REBALANCING based on IL graph analysis.
+        Apply continuous action with AUTO-REBALANCING based on IL graph analysis.
+
+        **Continuous Action Space**:
+        - action[0] = lower_pct: 현재가 대비 하한선 비율 (1% ~ 60%)
+        - action[1] = upper_pct: 현재가 대비 상한선 비율 (1% ~ 60%)
+        - 예: action=[0.10, 0.20] → 현재가 -10% ~ +20% 범위 (비대칭)
 
         **Auto-Rebalancing Logic** (see docs/il_graph.png):
-        - Model selects desired tick_width (range size preference)
+        - Model selects desired range bounds
         - Actual rebalancing only occurs when:
           1. No position exists (first step)
-          2. Edge proximity > 70% (IL acceleration zone)
-          3. Tick width changed AND price near edge (>50%)
-
-        This saves gas by avoiding unnecessary rebalancing while
-        preventing IL acceleration in the danger zone.
+          2. Edge proximity > threshold (IL acceleration zone)
+          3. Range bounds changed significantly AND price near edge
 
         Args:
-            action: Integer action index (0 to len(TICK_WIDTH_OPTIONS)-1)
+            action: numpy array [lower_pct, upper_pct]
             debug: If True, print debug information
 
         Returns:
             True if position was rebalanced
         """
-        # Get tick width from action
-        tick_width = self.TICK_WIDTH_OPTIONS[action]
-        self.desired_tick_width = tick_width  # Store model's preference
+        # Extract and clip action values (3D Action Space)
+        # action[0] = lower_pct: 1%~99% (가격 > 0 제약)
+        # action[1] = upper_pct: 1%~500% (실용적 상한)
+        # action[2] = rebalance_signal: 0~1 (>0.5 시 즉시 리밸런싱)
+        lower_pct = float(np.clip(action[0], 0.01, 0.99))
+        upper_pct = float(np.clip(action[1], 0.01, 5.00))
+        rebalance_signal = float(np.clip(action[2], 0.0, 1.0))
+
+        # Store model's preference
+        self.desired_lower_pct = lower_pct
+        self.desired_upper_pct = upper_pct
+        self.rebalance_signal = rebalance_signal
 
         # Get current price
         current_idx = self.episode_start_idx + self.current_step
@@ -892,13 +919,14 @@ class UniswapV3LPEnv(gym.Env):
         # Based on IL asymmetry analysis (docs/updownildifference.png):
         # - Price DOWN (→ lower bound): IL is ~1.8x more sensitive
         # - Price UP (→ upper bound): IL is gentler
-        #
-        # Asymmetric thresholds:
-        # - Approaching LOWER bound: 65-70% (rebalance earlier!)
-        # - Approaching UPPER bound: 75-80% (can wait longer)
 
         no_position = self.position_min_price <= 0
-        width_changed = tick_width != self.current_tick_width
+
+        # Check if bounds changed significantly (>5% difference)
+        bounds_changed = (
+            abs(lower_pct - getattr(self, 'current_lower_pct', 0)) > 0.05 or
+            abs(upper_pct - getattr(self, 'current_upper_pct', 0)) > 0.05
+        )
 
         # Determine direction and apply asymmetric threshold
         if no_position:
@@ -918,16 +946,20 @@ class UniswapV3LPEnv(gym.Env):
 
         in_warning_zone = edge_proximity > 0.5  # > 50%
 
+        # 모델의 rebalance_signal이 0.5 초과하면 즉시 리밸런싱
+        model_wants_rebalance = rebalance_signal > 0.5
+
         need_rebalance = (
             no_position or                          # First position
+            model_wants_rebalance or                # Model explicitly requests rebalancing
             in_danger_zone or                       # IL acceleration zone (asymmetric)
-            (width_changed and in_warning_zone)     # Width change near edge
+            (bounds_changed and in_warning_zone)    # Bounds change near edge
         )
 
         if not need_rebalance:
             if debug:
                 print(f"[NoRebalance] Step {self.current_step}: edge={edge_proximity:.1%}, "
-                      f"dir={direction}, width={tick_width}, current_width={self.current_tick_width}")
+                      f"signal={rebalance_signal:.2f}, lower={lower_pct:.1%}, upper={upper_pct:.1%}")
             return False
 
         # === EXECUTE REBALANCING ===
@@ -936,15 +968,17 @@ class UniswapV3LPEnv(gym.Env):
         token0_decimals = self.pool_config['token0']['decimals']
         token1_decimals = self.pool_config['token1']['decimals']
 
-        if self.invert_price:
-            current_tick = price_to_tick(current_price, token0_decimals, token1_decimals)
-        else:
-            current_tick = price_to_tick(1.0 / current_price, token0_decimals, token1_decimals)
+        # Calculate asymmetric price bounds
+        new_min_price = current_price * (1.0 - lower_pct)
+        new_max_price = current_price * (1.0 + upper_pct)
 
-        # Calculate new tick bounds: symmetric around current tick
-        half_width_ticks = tick_width // 2
-        new_tick_lower = current_tick - half_width_ticks
-        new_tick_upper = current_tick + half_width_ticks
+        # Convert prices to ticks
+        if self.invert_price:
+            new_tick_lower = price_to_tick(new_min_price, token0_decimals, token1_decimals)
+            new_tick_upper = price_to_tick(new_max_price, token0_decimals, token1_decimals)
+        else:
+            new_tick_lower = price_to_tick(1.0 / new_max_price, token0_decimals, token1_decimals)
+            new_tick_upper = price_to_tick(1.0 / new_min_price, token0_decimals, token1_decimals)
 
         # Snap to valid tick spacing
         new_tick_lower = (new_tick_lower // tick_spacing) * tick_spacing
@@ -966,13 +1000,21 @@ class UniswapV3LPEnv(gym.Env):
             self.position_min_price = 1.0 / new_max if new_max > 0 else 0
             self.position_max_price = 1.0 / new_min if new_min > 0 else 0
 
-        # Update current tick width
-        self.current_tick_width = tick_width
+        # Update current bounds
+        self.current_lower_pct = lower_pct
+        self.current_upper_pct = upper_pct
 
         if debug:
-            reason = "first" if no_position else ("danger" if in_danger_zone else "width_change")
+            if no_position:
+                reason = "first"
+            elif model_wants_rebalance:
+                reason = "signal"
+            elif in_danger_zone:
+                reason = "danger"
+            else:
+                reason = "bounds_change"
             print(f"[Rebalance:{reason}] Step {self.current_step}: edge={edge_proximity:.1%}, "
-                  f"tick_width={tick_width}")
+                  f"signal={rebalance_signal:.2f}, lower={lower_pct:.1%}, upper={upper_pct:.1%}")
             print(f"  Price: {current_price:.2f}, Range: [{self.position_min_price:.2f}, {self.position_max_price:.2f}]")
 
         # Update tick bounds for fee calculation
@@ -1609,8 +1651,9 @@ class UniswapV3LPEnv(gym.Env):
         hodl_value = self.hodl_token0 + (self.hodl_token1 * current_price)
 
         # === 2. LP 포트폴리오 현재 가치 ===
-        # LP = 현재 포지션 가치 + 누적 수수료 (gas는 이미 position_value에서 차감됨)
-        lp_value = self.current_position_value + self.cumulative_fees
+        # _get_lp_value 사용: V3 유동성 공식으로 정확한 토큰 가치 계산
+        # (current_position_value는 근사값이므로 사용하지 않음)
+        lp_value = self._get_lp_value(current_price)
 
         # === 3. 수익률 계산 ===
         if self.initial_investment > 0:

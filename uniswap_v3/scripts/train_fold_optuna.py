@@ -8,7 +8,7 @@ Paper: arXiv:2501.07508 - Section 5 & Appendix A
 - 50 agents trained per fold, best selected
 
 Usage:
-  python train_fold_optuna.py --fold 1 --trials 50 --steps 100000
+  python train_fold_optuna.py --fold 1 --trials 50 --steps 200000
 """
 import argparse
 import sqlite3
@@ -79,8 +79,8 @@ def load_data_from_db(db_path: Path) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def create_env(data: pd.DataFrame, action_space: list):
-    """Create environment with custom action space."""
+def create_env(data: pd.DataFrame):
+    """Create environment with continuous action space."""
     pool_config = {
         'protocol': int(data['protocol_id'].iloc[0]),
         'feeTier': int(data['fee_tier'].iloc[0]),
@@ -94,67 +94,44 @@ def create_env(data: pd.DataFrame, action_space: list):
         initial_investment=10000,
         episode_length_hours=len(data) - 10
     )
-
-    # Override action space
-    env.TICK_WIDTH_OPTIONS = action_space
-    from gymnasium import spaces
-    env.action_space = spaces.Discrete(len(action_space))
+    # 3D Continuous action space is already set in environment:
+    # action[0] = lower_pct (1% ~ 99%)
+    # action[1] = upper_pct (1% ~ 500%)
+    # action[2] = rebalance_signal (0 ~ 1)
 
     return Monitor(env)
 
 
 def objective(trial, train_data, total_steps):
-    """Optuna objective function - optimize hyperparameters."""
+    """Optuna objective function - optimize hyperparameters for 3D continuous action space."""
 
-    # 1. Action Space Selection (adjusted for ETH 24h movement: avg 3.12%, 95th pct 9.25%)
-    # tick_width = total ticks, half_width = tick_width // 2
-    # 500 ticks → ±2.5%
-    # 1000 ticks → ±5%
-    # 2000 ticks → ±10%
-    action_space_options = [
-        [0, 500, 1000],           # Narrow 3-action
-        [0, 500, 1000, 2000],     # Standard 4-action (default)
-        [0, 1000, 2000],          # Wide 3-action
-        [0, 500, 1000, 1500, 2000],# Full 5-action
-        [0, 750, 1500],           # Medium 3-action
-        [0, 1000, 1500, 2000],    # Wide 4-action
-    ]
-    action_space_idx = trial.suggest_categorical('action_space_idx', list(range(len(action_space_options))))
-    action_space = action_space_options[action_space_idx]
+    # 3D Action Space (환경에서 이미 설정됨):
+    # action[0] = lower_pct (1% ~ 99%)
+    # action[1] = upper_pct (1% ~ 500%)
+    # action[2] = rebalance_signal (0 ~ 1)
 
-    # 2. Network Architecture (Paper Table 1)
-    hidden_layer_options = [
-        [4, 2],
-        [6, 4],
-        [6, 6, 6],
-        [8, 2],
-        [8, 4],
-        [10, 2],
-        [6, 2],
-    ]
-    hidden_layer_idx = trial.suggest_categorical('hidden_layer_idx', list(range(len(hidden_layer_options))))
-    hidden_layers = hidden_layer_options[hidden_layer_idx]
+    # 1. Network Architecture - 64x64 고정
+    hidden_layers = [64, 64]
 
-    # 3. Activation Function (Paper Table 1)
-    activation_name = trial.suggest_categorical('activation', ['sigmoid', 'relu', 'tanh'])
+    # 2. Activation Function
+    activation_name = trial.suggest_categorical('activation', ['relu', 'tanh'])
     activation_fn = {
-        'sigmoid': nn.Sigmoid,
         'relu': nn.ReLU,
         'tanh': nn.Tanh
     }[activation_name]
 
-    # 4. PPO Hyperparameters (Paper Table 2)
-    learning_rate = trial.suggest_categorical('learning_rate', [0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01])
-    clip_range = trial.suggest_categorical('clip_range', [0.05, 0.1, 0.2, 0.4])
-    ent_coef = trial.suggest_categorical('ent_coef', [0.00001, 0.0001, 0.001, 0.01])
-    gamma = trial.suggest_categorical('gamma', [0.9, 0.99, 0.999, 0.9999])
+    # 3. PPO Hyperparameters (연속 제어에 맞게 조정)
+    learning_rate = trial.suggest_float('learning_rate', 1e-5, 1e-3, log=True)
+    clip_range = trial.suggest_float('clip_range', 0.1, 0.3)
+    ent_coef = trial.suggest_float('ent_coef', 1e-4, 1e-2, log=True)
+    gamma = trial.suggest_float('gamma', 0.95, 0.999)
 
-    # Create environment with custom action space
-    env = DummyVecEnv([lambda: create_env(train_data, action_space)])
+    # Create environment (continuous action space)
+    env = DummyVecEnv([lambda: create_env(train_data)])
 
-    # Create model
+    # Create model with separate policy/value networks
     policy_kwargs = dict(
-        net_arch=hidden_layers,
+        net_arch=dict(pi=hidden_layers, vf=hidden_layers),  # Separate actor/critic
         activation_fn=activation_fn
     )
 
@@ -185,9 +162,7 @@ def objective(trial, train_data, total_steps):
 
     env.close()
 
-    # Store action space in trial for later retrieval
-    trial.set_user_attr('action_space', action_space)
-    trial.set_user_attr('hidden_layers', hidden_layers)
+    # Store hyperparameters in trial for later retrieval
     trial.set_user_attr('activation', activation_name)
 
     return mean_reward
@@ -233,8 +208,7 @@ def train_with_optuna(fold: int, n_trials: int, total_steps: int):
     print("Best Trial Results:")
     print(f"{'='*60}")
     print(f"  Best Reward: {best_trial.value:.2f}")
-    print(f"  Action Space: {best_trial.user_attrs['action_space']}")
-    print(f"  Hidden Layers: {best_trial.user_attrs['hidden_layers']}")
+    print(f"  Hidden Layers: [64, 64] (fixed)")
     print(f"  Activation: {best_trial.user_attrs['activation']}")
     print(f"  Learning Rate: {best_trial.params['learning_rate']}")
     print(f"  Clip Range: {best_trial.params['clip_range']}")
@@ -246,15 +220,14 @@ def train_with_optuna(fold: int, n_trials: int, total_steps: int):
     print("Retraining best model...")
     print(f"{'='*60}")
 
-    action_space = best_trial.user_attrs['action_space']
-    hidden_layers = best_trial.user_attrs['hidden_layers']
+    hidden_layers = [64, 64]  # Fixed network size
     activation_name = best_trial.user_attrs['activation']
-    activation_fn = {'sigmoid': nn.Sigmoid, 'relu': nn.ReLU, 'tanh': nn.Tanh}[activation_name]
+    activation_fn = {'relu': nn.ReLU, 'tanh': nn.Tanh}[activation_name]
 
-    env = DummyVecEnv([lambda: create_env(train_data, action_space)])
+    env = DummyVecEnv([lambda: create_env(train_data)])
 
     policy_kwargs = dict(
-        net_arch=hidden_layers,
+        net_arch=dict(pi=hidden_layers, vf=hidden_layers),  # Separate actor/critic
         activation_fn=activation_fn
     )
 
@@ -294,7 +267,7 @@ def train_with_optuna(fold: int, n_trials: int, total_steps: int):
         'total_steps': total_steps,
         'n_trials': n_trials,
         'best_reward': best_trial.value,
-        'action_space': action_space,
+        'action_space': '3D_continuous',  # [lower_pct, upper_pct, rebalance_signal]
         'hidden_layers': hidden_layers,
         'activation': activation_name,
         'learning_rate': best_trial.params['learning_rate'],
@@ -316,21 +289,22 @@ def main():
     parser = argparse.ArgumentParser(description='Train fold with Optuna optimization')
     parser.add_argument('--fold', type=int, default=1, help='Fold number')
     parser.add_argument('--trials', type=int, default=50, help='Number of Optuna trials (paper: 50)')
-    parser.add_argument('--steps', type=int, default=100000, help='Steps per trial (paper: 100K)')
+    parser.add_argument('--steps', type=int, default=200000, help='Steps per trial (default: 200K)')
 
     args = parser.parse_args()
 
     print("="*60)
-    print(f"Optuna Hyperparameter Optimization (Paper: arXiv:2501.07508)")
+    print(f"Optuna Hyperparameter Optimization (3D Action Space)")
     print("="*60)
     print(f"  Fold: {args.fold}")
     print(f"  Trials: {args.trials}")
     print(f"  Steps per trial: {args.steps:,}")
     print()
+    print("Configuration:")
+    print("  - Action Space: 3D Continuous [lower_pct, upper_pct, rebalance_signal]")
+    print("  - Network: [64, 64] (fixed)")
+    print("  - Activation: relu, tanh")
     print("Optimizing:")
-    print("  - Action Space: [0,10,20], [0,20,50], [0,40,50,60], ...")
-    print("  - Network: [4,2], [6,4], [8,2], ...")
-    print("  - Activation: sigmoid, relu, tanh")
     print("  - LR, Clip, Entropy, Gamma")
     print("="*60)
 
