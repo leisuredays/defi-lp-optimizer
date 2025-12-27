@@ -139,15 +139,15 @@ class UniswapV3LPEnv(gym.Env):
         else:
             self.protocol = protocol_raw
 
-        # Action space: Discrete (Paper: arXiv:2501.07508, Table 1)
+        # Action space: Discrete (v8: wider ranges, fewer actions)
         # action=0: No rebalance (keep current position)
-        # action=1,2,3: Rebalance with tick width = TICK_WIDTH_OPTIONS[action]
+        # action=1+: Rebalance with tick width = TICK_WIDTH_OPTIONS[action]
         # Tick width = total ticks in range (half_width = tick_width // 2)
-        # ETH hourly volatility ~1.16%, need wider ranges for in-range:
-        #   100 ticks → ±0.5% → ~58% in-range
-        #   200 ticks → ±1.0% → ~78% in-range
-        #   400 ticks → ±2.0% → ~92% in-range
-        self.TICK_WIDTH_OPTIONS = [0, 100, 200, 400]  # 0=no rebalance
+        # 1 tick ≈ 0.01% price change
+        #   4000 ticks  → ±20%  (medium)
+        #   8000 ticks  → ±40%  (wide)
+        #   16000 ticks → ±80%  (very wide)
+        self.TICK_WIDTH_OPTIONS = [0, 4000, 8000, 16000]  # 4 actions
         self.action_space = spaces.Discrete(len(self.TICK_WIDTH_OPTIONS))
 
         # Observation space: 11 dimensions (Paper: arXiv:2501.07508)
@@ -169,6 +169,8 @@ class UniswapV3LPEnv(gym.Env):
         self.cumulative_fees = 0.0
         self.cumulative_il = 0.0  # Sum of IL from each position (accumulated when rebalancing)
         self.unrealized_il = 0.0  # Current unrealized IL (for display, not accumulated)
+        self.prev_unrealized_il = 0.0  # Previous step's unrealized IL (for delta calculation)
+        self.cumulative_il_delta = 0.0  # Sum of IL deltas (for tracking total IL-based penalty)
         self.cumulative_lvr = 0.0  # Sum of LVR penalties (accumulated every step)
         self.cumulative_gas = 0.0
         self.time_since_last_rebalance = 0
@@ -177,6 +179,7 @@ class UniswapV3LPEnv(gym.Env):
         self.initial_token_amounts = [0.0, 0.0]  # Current position's mint tokens (updates at each rebalancing)
         self.current_position_value = 0.0  # Actual position value (decreases with IL/gas, increases with fees)
         self.mint_price = 0.0  # Price when current position was minted (for IL calculation)
+        self.position_investment = 0.0  # Investment at position creation (fixed until rebalance, for IL calculation)
 
         # Fee growth tracking (backtest-accurate fee calculation)
         self.prev_fg0 = 0  # Previous feeGrowthGlobal0X128
@@ -399,11 +402,14 @@ class UniswapV3LPEnv(gym.Env):
         self.cumulative_fees = 0.0
         self.cumulative_il = 0.0  # Sum of IL from all positions
         self.unrealized_il = 0.0  # Current unrealized IL
+        self.prev_unrealized_il = 0.0  # Previous step's unrealized IL (for delta)
+        self.cumulative_il_delta = 0.0  # Sum of IL deltas (IL-based penalty)
         self.cumulative_lvr = 0.0  # Sum of LVR penalties
         self.cumulative_gas = 0.0
         self.time_since_last_rebalance = 0
         self.total_rebalances = 0
         self.current_position_value = self.initial_investment  # Start with full investment
+        self.position_investment = self.initial_investment  # Investment at position creation (for IL calc)
 
         # Initialize fee growth tracking (backtest-accurate fee calculation)
         self.prev_fg0 = int(current_data.get('feeGrowthGlobal0X128', 0) or 0)
@@ -670,6 +676,7 @@ class UniswapV3LPEnv(gym.Env):
             # This resets the HODL baseline for the next position's IL calculation
             self.initial_token_amounts = new_tokens_needed
             self.mint_price = current_price  # New mint price for IL calculation
+            self.position_investment = self.current_position_value  # New position's investment baseline
         else:
             self.time_since_last_rebalance += 1
 
@@ -677,37 +684,67 @@ class UniswapV3LPEnv(gym.Env):
         total_gas_cost = base_gas_cost + swap_cost
 
         # =================================================================
-        # LVR CALCULATION (Paper: arXiv:2208.06046, arXiv:2501.07508)
-        # LVR is calculated EVERY step (unlike IL which was only on rebalance)
-        # IMPORTANT: Use RETURNS volatility σ, NOT price volatility
+        # IL DELTA CALCULATION (User Request: Use IL instead of LVR)
+        # IL is recalculated every step, and the DELTA is used as penalty
+        # CRITICAL: When rebalancing, IL is REALIZED (locked in as real loss)
         # =================================================================
         current_price = current_data['close']
+        current_tick = int(current_data.get('tick', 0))
 
-        # Calculate RETURNS volatility (24-hour window)
-        # σ = std(returns) where returns = (P_t - P_{t-1}) / P_{t-1}
+        # Check if position is In-Range
+        in_range = self.tick_lower <= current_tick <= self.tick_upper
+
+        # =================================================================
+        # IL DELTA CALCULATION (v8 fix: no double-counting)
+        #
+        # IL is penalized incrementally every step as il_delta.
+        # When rebalancing, we DON'T apply full IL again (that would double-count).
+        # Instead, we just apply the final delta for this step.
+        #
+        # The cumulative IL penalty = sum of all il_deltas over time
+        # This equals the total IL experienced, without double-counting.
+        # =================================================================
+
+        # Calculate this step's IL change (same logic for both cases)
+        il_delta = self.unrealized_il - self.prev_unrealized_il
+
+        # Track cumulative IL delta
+        self.cumulative_il_delta += il_delta
+
+        if did_rebalance:
+            # Reset prev_unrealized_il to 0 for next step
+            # (new position starts with IL = 0 since mint_price = current_price)
+            self.prev_unrealized_il = 0.0
+        else:
+            # Update prev_unrealized_il for next step
+            self.prev_unrealized_il = self.unrealized_il
+
+        # Calculate RETURNS volatility for info (keep for debugging)
         lookback = min(24, current_idx)
-        if lookback < 3:  # Need at least 3 points for meaningful returns std
+        if lookback < 3:
             lookback = 3
         recent_prices = self.features_df.iloc[current_idx-lookback:current_idx+1]['close'].values
-
-        # Calculate hourly returns
         returns = np.diff(recent_prices) / recent_prices[:-1]
         returns_volatility = np.std(returns)
-
-        # Handle edge case: use default 0.2% hourly volatility
-        # (approximately 2% daily volatility / sqrt(24))
         if returns_volatility <= 0 or np.isnan(returns_volatility):
             returns_volatility = 0.002
 
-        # Calculate LVR penalty for this step using exact paper formula
-        lvr = self._calculate_lvr(current_price, returns_volatility)
+        # LVR calculation (kept for comparison in info dict, not used in reward)
+        if in_range:
+            lvr = self._calculate_lvr(current_price, returns_volatility)
+        else:
+            lvr = 0.0
 
-        # Track cumulative LVR
+        # Track cumulative LVR (for info/comparison only)
         self.cumulative_lvr += lvr
 
-        # Calculate reward using LVR-based formula
-        # R = fees - LVR - gas (gas only when rebalancing)
-        reward = self._calculate_reward(fees_earned, lvr, total_gas_cost, did_rebalance, current_data)
+        # =================================================================
+        # REWARD CALCULATION: fees - il_delta - gas
+        # IL delta replaces LVR as the per-step penalty
+        # - il_delta > 0: IL increased → penalty
+        # - il_delta < 0: IL decreased → bonus
+        # =================================================================
+        reward = self._calculate_reward_il(fees_earned, il_delta, total_gas_cost, did_rebalance)
 
         # Check episode termination
         self.current_step += 1
@@ -721,13 +758,16 @@ class UniswapV3LPEnv(gym.Env):
 
         # Info dict
         lvr_weight = self.reward_weights.get('lvr_weight', 1.0)
+        il_weight = self.reward_weights.get('il_weight', 1.0)
         info = {
             'fees': fees_earned,
-            'lvr': lvr,  # LVR penalty this step
+            'il_delta': il_delta,  # Change in IL this step (NEW: used in reward)
+            'lvr': lvr,  # LVR (kept for comparison, not used in reward)
             'lvr_weight': lvr_weight,  # LVR weight (β) for debugging
             'il': il_incurred,  # Keep IL for backward compat
             'realized_il': self.cumulative_il,  # Total IL realized through rebalancing
             'unrealized_il': self.unrealized_il,  # Current unrealized IL
+            'cumulative_il_delta': self.cumulative_il_delta,  # Total IL delta (NEW: IL-based penalty)
             'cumulative_lvr': self.cumulative_lvr,  # Total LVR accumulated
             'volatility': returns_volatility,  # Returns volatility σ (for debugging)
             'gas': total_gas_cost,  # Includes base gas + swap cost (tracked, not in reward)
@@ -737,9 +777,10 @@ class UniswapV3LPEnv(gym.Env):
             'cumulative_fees': self.cumulative_fees,
             'cumulative_il': self.cumulative_il,  # Keep for backward compat
             'cumulative_gas': self.cumulative_gas,
-            'net_return': self.cumulative_fees - self.cumulative_lvr - self.cumulative_gas,  # Actual P&L
-            # reward_net_return = cumulative(fees - β*LVR) - gas excluded from reward
-            'reward_net_return': self.cumulative_fees - lvr_weight * self.cumulative_lvr,
+            # NEW: Net return now uses IL delta instead of LVR
+            'net_return': self.cumulative_fees - self.cumulative_il_delta - self.cumulative_gas,
+            # reward_net_return = cumulative(fees - IL_delta) - gas excluded from reward
+            'reward_net_return': self.cumulative_fees - il_weight * self.cumulative_il_delta,
             'current_position_value': self.current_position_value,  # Actual portfolio value
             'in_range': self.tick_lower <= int(current_data.get('tick', 0)) <= self.tick_upper
         }
@@ -1148,8 +1189,9 @@ class UniswapV3LPEnv(gym.Env):
             return 0.0
 
         # Use whitepaper formula for IL calculation
+        # CRITICAL: Use position_investment (fixed at position creation), NOT current_position_value
         result = calculate_il_whitepaper(
-            investment=self.current_position_value,
+            investment=self.position_investment,
             mint_price=self.mint_price,
             current_price=current_price,
             pa=position_min,
@@ -1158,10 +1200,11 @@ class UniswapV3LPEnv(gym.Env):
 
         # IL is negative when LP < HODL (loss)
         # We return positive value as loss
-        il_pct = result['il_pct']
+        # Use il_usd directly from result (LP - HODL in USD)
+        il_usd = result.get('il_usd', 0.0)
 
-        # IL is always expressed as a loss (positive value)
-        il_usd = abs(il_pct) * self.current_position_value
+        # IL is typically negative (LP < HODL), so take abs for "loss" amount
+        il_usd = abs(il_usd)
 
         # Sanity check: IL can't exceed position value
         il_usd = min(il_usd, self.current_position_value * 0.5)  # Cap at 50%
@@ -1282,6 +1325,44 @@ class UniswapV3LPEnv(gym.Env):
         gas_penalty = gas if did_rebalance else 0.0
 
         reward = fees - lvr_weight * lvr - gas_penalty
+
+        # Replace NaN reward with 0
+        if np.isnan(reward) or np.isinf(reward):
+            reward = 0.0
+
+        return reward
+
+    def _calculate_reward_il(self, fees: float, il_delta: float, gas: float, did_rebalance: bool) -> float:
+        """
+        Calculate reward using IL delta (change in impermanent loss) instead of LVR.
+
+        Formula: R = fees - il_delta - I[a≠0] * gas
+
+        IL delta captures the incremental cost of IL each step:
+        - il_delta > 0: IL increased (price moved away from mint) → penalty
+        - il_delta < 0: IL decreased (price moved back toward mint) → bonus
+
+        Args:
+            fees: Fees earned this step (USD)
+            il_delta: Change in unrealized IL from previous step (USD)
+            gas: Gas cost if rebalancing occurred (USD)
+            did_rebalance: Whether a rebalance happened this step
+
+        Returns:
+            Reward value
+        """
+        # Sanitize inputs
+        fees = 0.0 if np.isnan(fees) else fees
+        il_delta = 0.0 if np.isnan(il_delta) else il_delta
+        gas = 0.0 if np.isnan(gas) else gas
+
+        # Gas only applies when rebalancing
+        gas_penalty = gas if did_rebalance else 0.0
+
+        # IL delta weight (default 1.0, can be tuned)
+        il_weight = self.reward_weights.get('il_weight', 1.0)
+
+        reward = fees - il_weight * il_delta - gas_penalty
 
         # Replace NaN reward with 0
         if np.isnan(reward) or np.isinf(reward):
