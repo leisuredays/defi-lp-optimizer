@@ -141,10 +141,13 @@ class UniswapV3LPEnv(gym.Env):
 
         # Action space: Discrete (Paper: arXiv:2501.07508, Table 1)
         # action=0: No rebalance (keep current position)
-        # action=1,2: Rebalance with tick width = TICK_WIDTH_OPTIONS[action]
-        # Tick width determines symmetric range around current price
-        # Paper uses [0, 20, 50] for first window (2022-05-14)
-        self.TICK_WIDTH_OPTIONS = [0, 20, 50]  # 0=no rebalance
+        # action=1,2,3: Rebalance with tick width = TICK_WIDTH_OPTIONS[action]
+        # Tick width = total ticks in range (half_width = tick_width // 2)
+        # ETH hourly volatility ~1.16%, need wider ranges for in-range:
+        #   100 ticks → ±0.5% → ~58% in-range
+        #   200 ticks → ±1.0% → ~78% in-range
+        #   400 ticks → ±2.0% → ~92% in-range
+        self.TICK_WIDTH_OPTIONS = [0, 100, 200, 400]  # 0=no rebalance
         self.action_space = spaces.Discrete(len(self.TICK_WIDTH_OPTIONS))
 
         # Observation space: 11 dimensions (Paper: arXiv:2501.07508)
@@ -791,8 +794,8 @@ class UniswapV3LPEnv(gym.Env):
             current_tick = price_to_tick(1.0 / current_price, token0_decimals, token1_decimals)
 
         # Calculate new tick bounds: symmetric around current tick
-        # tick_width is in units of tick_spacing
-        half_width_ticks = tick_width * tick_spacing // 2
+        # tick_width is the total width in ticks (paper: arXiv:2501.07508)
+        half_width_ticks = tick_width // 2
         new_tick_lower = current_tick - half_width_ticks
         new_tick_upper = current_tick + half_width_ticks
 
