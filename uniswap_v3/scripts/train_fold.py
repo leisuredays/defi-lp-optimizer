@@ -92,23 +92,21 @@ def create_env(data: pd.DataFrame, episode_length: int = None):
         historical_data=data,
         pool_config=pool_config,
         initial_investment=10000,
-        episode_length_hours=episode_length,
-        obs_dim=28
+        episode_length_hours=episode_length
     )
     return Monitor(env)
 
 
-def train_fresh(fold: int, total_steps: int, version: str = "v2"):
-    """Train a fold model from scratch."""
+def train_fresh(fold: int, total_steps: int, version: str = "v4"):
+    """Train a fold model from scratch (Paper: arXiv:2501.07508 style)."""
 
     base_dir = project_root / "uniswap_v3/models/rolling_wfe"
     db_path = project_root / "uniswap_v3/data/pool_data.db"
 
-    # Configuration
-    WINDOW_DAYS = 180
-    TEST_DAYS = 30
-    WINDOW_HOURS = WINDOW_DAYS * 24
-    TEST_HOURS = TEST_DAYS * 24
+    # Configuration (Paper: arXiv:2501.07508, Section 6)
+    # Training: 7,500 hours (~10 months), Testing: 1,500 hours (~2 months)
+    WINDOW_HOURS = 7500  # ~312.5 days training
+    TEST_HOURS = 1500    # ~62.5 days testing
 
     # Calculate fold data range
     train_start = (fold - 1) * TEST_HOURS
@@ -120,22 +118,33 @@ def train_fresh(fold: int, total_steps: int, version: str = "v2"):
     train_data = data.iloc[train_start:train_end].reset_index(drop=True)
     print(f"Training data: {len(train_data)} hours ({len(train_data)/24:.0f} days)")
 
-    # Create environment
+    # Create environment (no normalization - paper style)
     env = DummyVecEnv([lambda: create_env(train_data)])
 
     # Create NEW model from scratch
+    # Paper hyperparameters (Table 1, 2 - arXiv:2501.07508)
     print(f"\nCreating new PPO model (version: {version})...")
+
+    # Network architecture (Table 1)
+    # Hidden layers: [6, 4], Activation: sigmoid
+    import torch.nn as nn
+    policy_kwargs = dict(
+        net_arch=[6, 4],  # Hidden layers
+        activation_fn=nn.Sigmoid  # Activation function
+    )
+
     model = PPO(
         "MlpPolicy",
         env,
-        learning_rate=3e-4,
+        policy_kwargs=policy_kwargs,
+        learning_rate=0.00005,  # Table 2: LR
         n_steps=2048,
         batch_size=64,
         n_epochs=10,
-        gamma=0.99,
+        gamma=0.999,            # Table 2: γ
         gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.01,
+        clip_range=0.05,        # Table 2: Clip
+        ent_coef=0.00001,       # Table 2: c2 (entropy)
         vf_coef=0.5,
         max_grad_norm=0.5,
         verbose=0,
@@ -143,7 +152,7 @@ def train_fresh(fold: int, total_steps: int, version: str = "v2"):
     )
 
     print(f"\nTraining for {total_steps:,} total steps...")
-    print(f"  Version: {version} (±8% minimum range)")
+    print(f"  Version: {version} (Paper style: discrete action, no normalization)")
 
     # Callbacks - save every 500K
     checkpoint_dir = base_dir / "checkpoints"
@@ -179,15 +188,24 @@ def train_fresh(fold: int, total_steps: int, version: str = "v2"):
 def main():
     parser = argparse.ArgumentParser(description='Train fold from scratch')
     parser.add_argument('--fold', type=int, default=1, help='Fold number')
-    parser.add_argument('--total', type=int, default=2000000, help='Total timesteps')
-    parser.add_argument('--version', type=str, default='v2', help='Model version tag')
+    parser.add_argument('--total', type=int, default=100000, help='Total timesteps (paper: 100K)')
+    parser.add_argument('--version', type=str, default='v4', help='Model version tag')
 
     args = parser.parse_args()
 
     print("="*60)
-    print(f"Training Fold {args.fold} from scratch")
+    print(f"Training Fold {args.fold} (Paper: arXiv:2501.07508)")
     print(f"  Total steps: {args.total:,}")
-    print(f"  Version: {args.version} (±8% minimum range)")
+    print(f"  Version: {args.version}")
+    print("  Hyperparameters (Table 1, 2):")
+    print("    - Action space: {0, 20, 50}")
+    print("    - Network: [6, 4] + sigmoid")
+    print("    - LR: 0.00005, Clip: 0.05, γ: 0.999")
+    print("    - Entropy: 0.00001")
+    print("  Environment:")
+    print("    - Observation: 11-dim")
+    print("    - Reward: fees - LVR - I[a≠0]*gas")
+    print("    - Gas: $5 per rebalance")
     print("="*60)
 
     train_fresh(args.fold, args.total, args.version)
