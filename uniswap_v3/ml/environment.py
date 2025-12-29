@@ -934,7 +934,7 @@ class UniswapV3LPEnv(gym.Env):
         in_warning_zone = edge_proximity > 0.5  # > 50%
 
         # 모델의 rebalance_signal이 0.5 초과하면 즉시 리밸런싱
-        model_wants_rebalance = rebalance_signal > 0.9  # Higher threshold: model must be very confident
+        model_wants_rebalance = rebalance_signal > 0.5  # As documented: > 0.5 triggers rebalancing
 
         # 자동 리밸런싱 제거 - 모델이 직접 결정
         need_rebalance = (
