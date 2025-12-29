@@ -128,9 +128,12 @@ def evaluate_model(model, data, name, max_hours=None):
     cumulative_il = []
     rebalance_timestamps = []
     rebalance_prices = []
+    rewards = []  # Track rewards
+    cumulative_rewards = []  # Cumulative rewards
 
     done = False
     prev_rebalances = 0
+    total_reward = 0.0
 
     while not done:
         action, _ = model.predict(obs, deterministic=True)
@@ -162,6 +165,11 @@ def evaluate_model(model, data, name, max_hours=None):
             rebalance_prices.append(info['current_price'])
             prev_rebalances = env.total_rebalances
 
+        # Track rewards
+        rewards.append(reward)
+        total_reward += reward
+        cumulative_rewards.append(total_reward)
+
     return {
         'name': name,
         'timestamps': timestamps,
@@ -176,6 +184,8 @@ def evaluate_model(model, data, name, max_hours=None):
         'cumulative_il': cumulative_il,
         'rebalance_timestamps': rebalance_timestamps,
         'rebalance_prices': rebalance_prices,
+        'rewards': rewards,  # Individual step rewards
+        'cumulative_rewards': cumulative_rewards,  # Cumulative rewards
         'total_rebalances': env.total_rebalances,
         'final_lp': info['lp_value'],
         'final_hodl': info['hodl_value'],
@@ -184,7 +194,7 @@ def evaluate_model(model, data, name, max_hours=None):
 
 def create_visualization(train_results, test_results, step_k):
     """Create visualization with rebalance points."""
-    fig, axes = plt.subplots(4, 2, figsize=(20, 16))
+    fig, axes = plt.subplots(5, 2, figsize=(20, 20))  # 5 rows for reward chart
 
     for col, results in enumerate([train_results, test_results]):
         name = results['name']
@@ -252,6 +262,20 @@ def create_visualization(train_results, test_results, step_k):
         ax4.legend(loc='best')
         ax4.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
         ax4.grid(True, alpha=0.3)
+
+        # Row 5: Cumulative Rewards
+        ax5 = axes[4, col]
+        ax5.set_title(f'{name}: Cumulative Reward', fontsize=11, fontweight='bold')
+        ax5.plot(results['timestamps'], results['cumulative_rewards'], 'purple',
+                 label=f'Total: ${results["cumulative_rewards"][-1]:.0f}', linewidth=1.5)
+        ax5.axhline(0, color='black', linewidth=0.5)
+        ax5.set_ylabel('Reward (USD)')
+        ax5.legend(loc='best')
+        ax5.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        ax5.grid(True, alpha=0.3)
+
+        for rt in results['rebalance_timestamps']:
+            ax5.axvline(rt, color='red', alpha=0.5, linewidth=1)
 
     plt.tight_layout()
 
