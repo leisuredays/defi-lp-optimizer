@@ -14,6 +14,7 @@ import StrategyOverview from '../layout/StrategyOverview';
 import PoolPriceLiquidity from '../layout/PoolPriceLiquidity';
 import StrategyBacktest from '../layout/StrategyBacktest';
 import AIPrediction from '../layout/AIPrediction';
+import TokenMonitor from '../layout/TokenMonitor';
 
 // Components //
 import Grid from "../components/Grid"
@@ -113,6 +114,7 @@ useEffect(() => {
           {/* <StrategyBacktest  page="uniswap" pageStyle={styles}></StrategyBacktest> */}
           <SideBar  page="uniswap" width={windowDim.width} minWidth={pageMinWidth} protocols={[0, 1, 2, 3, 5]} leverageHidden={true} pageStyle={styles}></SideBar>
           <AIPrediction page="uniswap" pageStyle={styles}></AIPrediction>
+          <TokenMonitor page="uniswap" pageStyle={styles}></TokenMonitor>
           <UniswapLink></UniswapLink>
           <DashBoard page="uniswap" pageStyle={styles}></DashBoard>
         </Grid>

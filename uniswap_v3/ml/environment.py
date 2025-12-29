@@ -160,13 +160,15 @@ class UniswapV3LPEnv(gym.Env):
         self.desired_upper_pct = 0.10  # Default 10%
         self.rebalance_signal = 0.0    # Model's rebalancing urgency
 
-        # Observation space: 11 dimensions (Paper: arXiv:2501.07508)
-        # [price, tick, width, liquidity, volatility, ma_24, ma_168, BB, ADXR, BOP, DX]
-        self.obs_dim = 11  # Override any passed value
+        # Observation space: 12 dimensions (장기 투자용)
+        # [price, tick, width, liquidity, volatility_7d, volatility_30d,
+        #  price_to_ma7d, price_to_ma30d, momentum_7d, momentum_30d,
+        #  edge_proximity_lower, edge_proximity_upper]
+        self.obs_dim = 12
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(11,),
+            shape=(12,),
             dtype=np.float32
         )
 
@@ -235,45 +237,25 @@ class UniswapV3LPEnv(gym.Env):
 
         # Price features
         df['returns'] = df['close'].pct_change()
-        # Paper (arXiv:2501.07508): Exponentially weighted volatility with α=0.05
-        df['ewma_volatility'] = df['returns'].ewm(alpha=0.05).std()
-        df['volatility_24h'] = df['ewma_volatility']  # Alias for backward compatibility
-        df['momentum_1h'] = df['close'].pct_change(1)
-        df['momentum_24h'] = df['close'].pct_change(24)
 
-        # Paper (arXiv:2501.07508): Moving averages for state space
-        df['ma_24h'] = df['close'].rolling(24).mean()
-        df['ma_168h'] = df['close'].rolling(168).mean()  # 1 week = 168 hours
+        # === LONG-TERM FEATURES (for LP investment) ===
+        # Volatility: 7-day and 30-day
+        df['volatility_7d'] = df['returns'].rolling(168).std()   # 7 days = 168 hours
+        df['volatility_30d'] = df['returns'].rolling(720).std()  # 30 days = 720 hours
 
-        # Technical indicators (Paper: arXiv:2501.07508, Section 5)
-        # Uses TA-Lib: BB, ADXR, BOP, DX
-        if TALIB_AVAILABLE and 'high' in df.columns and 'low' in df.columns:
-            close = df['close'].values
-            high = df['high'].values
-            low = df['low'].values
-            open_price = df.get('open', df['close']).values
+        # Moving averages: 7-day and 30-day
+        df['ma_7d'] = df['close'].rolling(168).mean()   # 7 days
+        df['ma_30d'] = df['close'].rolling(720).mean()  # 30 days
 
-            # Bollinger Bands - calculate position within bands (0-1)
-            upper, middle, lower = talib.BBANDS(close, timeperiod=20, nbdevup=2, nbdevdn=2)
-            # Position: 0 = at lower band, 0.5 = at middle, 1 = at upper band
-            band_width = upper - lower
-            df['bb_position'] = np.where(band_width > 0, (close - lower) / band_width, 0.5)
-            df['bb_position'] = df['bb_position'].clip(0, 1)
+        # Price momentum: 7-day and 30-day
+        df['momentum_7d'] = df['close'].pct_change(168)   # 7-day return
+        df['momentum_30d'] = df['close'].pct_change(720)  # 30-day return
 
-            # ADXR - Average Directional Movement Index Rating (trend strength)
-            df['adxr'] = talib.ADXR(high, low, close, timeperiod=14)
+        # Price relative to moving averages (trend indicators)
+        df['price_to_ma7d'] = df['close'] / df['ma_7d']
+        df['price_to_ma30d'] = df['close'] / df['ma_30d']
 
-            # BOP - Balance of Power (-1 to +1)
-            df['bop'] = talib.BOP(open_price, high, low, close)
-
-            # DX - Directional Movement Index (trend direction)
-            df['dx'] = talib.DX(high, low, close, timeperiod=14)
-        else:
-            # Fallback values if TA-Lib not available
-            df['bb_position'] = 0.5
-            df['adxr'] = 25.0
-            df['bop'] = 0.0
-            df['dx'] = 25.0
+        # BOP, BB, ADXR, DX 삭제 - 장기 투자 특성만 사용
 
         # Volume/TVL features (if available)
         if 'volume' in df.columns:
@@ -352,27 +334,32 @@ class UniswapV3LPEnv(gym.Env):
         # Select episode start (ensuring enough data for full episode)
         # Use features_df length since that's what _get_observation uses
         required_length = self.episode_length + 2  # Extra buffer for next_data
-        if len(self.features_df) < required_length:
-            raise ValueError(f"Not enough data: {len(self.features_df)} rows, need {required_length}")
 
-        # For backtest/evaluation: always start from beginning (deterministic)
-        # For training: random start for data augmentation
+        # Warmup period: 720 hours (30 days) for rolling features
+        # 30-day volatility, 30-day MA, 30-day momentum all need 720 hours of history
+        warmup_period = 720
+
+        if len(self.features_df) < warmup_period + required_length:
+            raise ValueError(f"Not enough data: {len(self.features_df)} rows, need {warmup_period + required_length}")
+
+        # For training: random start after warmup period
+        # Episode start must be >= warmup_period to ensure valid rolling features
         max_start = len(self.features_df) - required_length
-        if max_start > 0:
-            self.episode_start_idx = np.random.randint(0, max_start)
+        if max_start > warmup_period:
+            self.episode_start_idx = np.random.randint(warmup_period, max_start)
         else:
-            self.episode_start_idx = 0  # Start from beginning if data is tight
+            self.episode_start_idx = warmup_period  # Start right after warmup
         self.current_step = 0
 
         # Get initial market data
         current_data = self.features_df.iloc[self.episode_start_idx]
         self.initial_price = current_data['close']
-        volatility = current_data['volatility_24h']
+        volatility = current_data['volatility_7d']
 
-        # Initialize with default range: ±10% (symmetric)
-        # Model can change this via action, triggering rebalance if needed
-        default_lower_pct = 0.10  # -10% from current price
-        default_upper_pct = 0.10  # +10% from current price
+        # Initialize with wide range: ±100% (conservative start)
+        # Model learns to narrow down the range for higher fee concentration
+        default_lower_pct = 0.99  # -99% from current price (near 0)
+        default_upper_pct = 1.00  # +100% from current price (2x)
         self.current_lower_pct = default_lower_pct
         self.current_upper_pct = default_upper_pct
         self.desired_lower_pct = default_lower_pct
@@ -633,87 +620,86 @@ class UniswapV3LPEnv(gym.Env):
         base_gas_cost = self.gas_costs[self.protocol] if did_rebalance else 0.0
         swap_cost = 0.0  # Will be calculated in rebalance block
 
-        # Update unrealized IL (current snapshot, not accumulated)
+        # Update unrealized IL (current snapshot for display)
         self.unrealized_il = il_raw
-
-        # IL Logic:
-        # - Unrealized IL: Current IL that would be incurred if we rebalanced now
-        # - Realized IL: IL that was actually incurred when rebalancing (locked in)
-        #
-        # For reward calculation:
-        # - IL is ONLY penalized when rebalancing (when it becomes realized)
-        # - No per-step penalty: IL is a cumulative snapshot, not incremental
-        # - Penalizing snapshot IL every step would double-count the loss
-        if did_rebalance:
-            il_incurred = il_raw  # Full IL penalty at rebalancing (realized)
-            self.cumulative_il += il_raw  # Add to realized IL only when rebalancing
-        else:
-            il_incurred = 0.0  # No IL penalty: position not closed, loss not realized
 
         # Update cumulative metrics
         self.cumulative_fees += fees_earned
-        # NOTE: cumulative_il is now only updated when rebalancing (above)
         self.cumulative_gas += base_gas_cost
 
-        # Update current position value (reflects actual portfolio value)
-        # This happens every step: fees increase value, but IL/gas only realized on rebalance
-        if did_rebalance:
-            # On rebalance: apply IL and gas cost to position value
-            self.current_position_value = self.current_position_value - il_raw - base_gas_cost + fees_earned
-        else:
-            # No rebalance: only fees affect position value (IL is unrealized)
-            self.current_position_value = self.current_position_value + fees_earned
-
-        # Ensure position value doesn't go negative
-        self.current_position_value = max(0.0, self.current_position_value)
+        # IL is realized when rebalancing (calculated below from actual tokens)
+        # Note: cumulative_il is updated in the rebalance block using actual token values
 
         if did_rebalance:
             self.time_since_last_rebalance = 0
             self.total_rebalances += 1
 
-            # CRITICAL: Reset IL tracking after rebalancing
-            # When rebalancing, IL is "realized" and we start fresh with new position
+            # CRITICAL: Get ACTUAL tokens from current liquidity position
+            # This is the real LP value (IL is naturally included in token amounts)
             current_price = current_data['close']
 
-            # Step 1: Calculate current position tokens using ACTUAL position value
-            # (Not initial_investment - use current_position_value which reflects losses)
-            old_tokens = self._calculate_tokens_for_range(
-                self.current_position_value,  # Use ACTUAL current value
+            # Step 1: Get ACTUAL tokens from liquidity (NOT from running total!)
+            # get_token_amounts returns real token amounts based on L and current price
+            old_tokens = get_token_amounts(
+                int(self.liquidity),
                 current_price,
                 prev_min,  # Old ranges
-                prev_max
+                prev_max,
+                self.pool_config['token0']['decimals'],
+                self.pool_config['token1']['decimals']
             )
 
-            # Step 2: Calculate total value (should match current_position_value)
-            # Price is already in token1/token0 format (USDC/WETH)
-            price_human = current_price
-            # token0=USDC (already USD), token1=WETH
-            position_value = old_tokens[0] + (old_tokens[1] * price_human)
+            # Step 2: Calculate ACTUAL LP value from tokens
+            # token0 = WETH count, token1 = USDT value (already USD)
+            # This value naturally includes IL (lower than HODL when price moved)
+            actual_lp_value = (old_tokens[0] * current_price) + old_tokens[1]
 
-            # Step 3: Calculate required tokens for new range
-            # This uses Uniswap V3 math to get proper token ratio
+            # Step 3: Calculate IL for this position (for tracking)
+            # IL = LP value - HODL value (negative = loss)
+            # HODL = initial tokens at current price
+            hodl_value = (self.initial_token_amounts[0] * current_price) + self.initial_token_amounts[1]
+            realized_il = hodl_value - actual_lp_value  # Positive = loss
+            self.cumulative_il += max(0, realized_il)  # Only track losses
+
+            # Step 4: Apply gas cost and add this step's fees
+            # The actual value going into new position
+            position_value_after_costs = actual_lp_value - base_gas_cost + fees_earned
+            position_value_after_costs = max(0.0, position_value_after_costs)
+
+            # Step 5: Calculate required tokens for new range
             new_tokens_needed = self._calculate_tokens_for_range(
-                position_value,
+                position_value_after_costs,
                 current_price,
                 self.position_min_price,  # New ranges
                 self.position_max_price
             )
 
-            # Step 4: Calculate SWAP needed to reach required ratio
+            # Step 6: Calculate SWAP cost
             swap_cost = self._calculate_swap_cost(
                 old_tokens,
                 new_tokens_needed,
                 current_price
             )
 
-            # Add swap cost to cumulative gas and position value
+            # Add swap cost to cumulative gas
             self.cumulative_gas += swap_cost
-            self.current_position_value -= swap_cost
+
+            # Final position value for new position
+            final_position_value = position_value_after_costs - swap_cost
+            final_position_value = max(0.0, final_position_value)
+
+            # Recalculate tokens after swap cost deduction
+            new_tokens_needed = self._calculate_tokens_for_range(
+                final_position_value,
+                current_price,
+                self.position_min_price,
+                self.position_max_price
+            )
 
             # Recalculate liquidity for new position
             self.liquidity = liquidity_for_strategy(
                 current_price,
-                self.position_min_price,  # New ranges (already updated in _apply_action)
+                self.position_min_price,
                 self.position_max_price,
                 new_tokens_needed[0],
                 new_tokens_needed[1],
@@ -721,13 +707,14 @@ class UniswapV3LPEnv(gym.Env):
                 self.pool_config['token1']['decimals']
             )
 
-            # CRITICAL: Update initial token amounts to new position (new mint baseline)
-            # This resets the HODL baseline for the next position's IL calculation
+            # CRITICAL: Reset for new position
             self.initial_token_amounts = new_tokens_needed
-            self.mint_price = current_price  # New mint price for IL calculation
-            self.position_investment = self.current_position_value  # New position's investment baseline
+            self.mint_price = current_price
+            self.position_investment = final_position_value
+            self.current_position_value = final_position_value
         else:
             self.time_since_last_rebalance += 1
+            # No rebalance: position value unchanged (IL unrealized, tracked separately)
 
         # Total gas cost for this step (base gas + swap cost)
         total_gas_cost = base_gas_cost + swap_cost
@@ -830,7 +817,7 @@ class UniswapV3LPEnv(gym.Env):
             'il_delta': il_delta,  # Change in IL this step
             'lvr': lvr,  # LVR (kept for comparison)
             'lvr_weight': lvr_weight,
-            'il': il_incurred,
+            'il': il_raw,  # Unrealized IL at this step
             'realized_il': self.cumulative_il,
             'unrealized_il': self.unrealized_il,
             'cumulative_il_delta': self.cumulative_il_delta,
@@ -947,7 +934,7 @@ class UniswapV3LPEnv(gym.Env):
         in_warning_zone = edge_proximity > 0.5  # > 50%
 
         # 모델의 rebalance_signal이 0.5 초과하면 즉시 리밸런싱
-        model_wants_rebalance = rebalance_signal > 0.5
+        model_wants_rebalance = rebalance_signal > 0.9  # Higher threshold: model must be very confident
 
         need_rebalance = (
             no_position or                          # First position
@@ -1435,187 +1422,6 @@ class UniswapV3LPEnv(gym.Env):
 
         return lvr_capped
 
-    def _calculate_reward(self, fees: float, lvr: float, gas: float,
-                         did_rebalance: bool, current_data: pd.Series) -> float:
-        """
-        Calculate reward using paper formula (arXiv:2501.07508, Eq. 17).
-
-        Formula:
-        R = fees - LVR - I[rebalance] * gas
-
-        Where:
-        - fees: trading fees earned this step
-        - LVR: Loss-Versus-Rebalancing penalty (opportunity cost)
-        - gas: $5 per rebalance (only when action != 0)
-        - I[rebalance]: indicator function (1 if rebalanced, 0 otherwise)
-
-        Args:
-            fees: Fees earned this step
-            lvr: LVR penalty this step
-            gas: Gas cost for rebalancing
-            did_rebalance: Whether rebalancing occurred
-            current_data: Current market data
-
-        Returns:
-            Reward value
-        """
-        # Replace any NaN inputs with 0
-        fees = 0.0 if np.isnan(fees) else fees
-        lvr = 0.0 if np.isnan(lvr) else lvr
-        gas = 0.0 if np.isnan(gas) else gas
-
-        # =================================================================
-        # PAPER FORMULA (Eq. 17): R = fees - LVR - I[a≠0] * gas
-        # arXiv:2501.07508 - Deep Reinforcement Learning for Uniswap V3
-        # Gas ($5) only charged when rebalancing occurs
-        # =================================================================
-        lvr_weight = self.reward_weights.get('lvr_weight', 1.0)
-
-        # Gas only applies when rebalancing
-        gas_penalty = gas if did_rebalance else 0.0
-
-        reward = fees - lvr_weight * lvr - gas_penalty
-
-        # Replace NaN reward with 0
-        if np.isnan(reward) or np.isinf(reward):
-            reward = 0.0
-
-        return reward
-
-    def _calculate_reward_il(self, fees: float, il_delta: float, gas: float, did_rebalance: bool) -> float:
-        """
-        Calculate reward using IL delta (change in impermanent loss) instead of LVR.
-
-        Formula: R = fees - il_delta - I[a≠0] * gas
-
-        IL delta captures the incremental cost of IL each step:
-        - il_delta > 0: IL increased (price moved away from mint) → penalty
-        - il_delta < 0: IL decreased (price moved back toward mint) → bonus
-
-        Args:
-            fees: Fees earned this step (USD)
-            il_delta: Change in unrealized IL from previous step (USD)
-            gas: Gas cost if rebalancing occurred (USD)
-            did_rebalance: Whether a rebalance happened this step
-
-        Returns:
-            Reward value
-        """
-        # Sanitize inputs
-        fees = 0.0 if np.isnan(fees) else fees
-        il_delta = 0.0 if np.isnan(il_delta) else il_delta
-        gas = 0.0 if np.isnan(gas) else gas
-
-        # Gas only applies when rebalancing
-        gas_penalty = gas if did_rebalance else 0.0
-
-        # IL delta weight (default 1.0, can be tuned)
-        il_weight = self.reward_weights.get('il_weight', 1.0)
-
-        reward = fees - il_weight * il_delta - gas_penalty
-
-        # Replace NaN reward with 0
-        if np.isnan(reward) or np.isinf(reward):
-            reward = 0.0
-
-        return reward
-
-    def _calculate_reward_reactive(self, fees: float, il_delta: float,
-                                   current_price: float, did_rebalance: bool,
-                                   gas: float) -> float:
-        """
-        Reactive reward function: No volatility prediction, evaluate current state quality.
-
-        핵심 원리:
-        - 미래 변동성 예측 대신 "현재 포지션 상태"를 평가
-        - 중앙 = 좋은 상태 (보상)
-        - 경계 = 위험한 상태 (패널티)
-        - 좁은 범위 + 경계 = 매우 위험 (패널티 증폭)
-
-        모델 학습 효과:
-        - 고변동성 → 가격이 경계에 자주 접근 → 넓은 범위 선호 학습
-        - 저변동성 → 중앙 유지 용이 → 좁은 범위로 수수료 극대화 학습
-
-        Args:
-            fees: Fees earned this step (USD)
-            il_delta: Change in unrealized IL from previous step (USD)
-            current_price: Current market price
-            did_rebalance: Whether a rebalance happened this step
-            gas: Gas cost if rebalancing occurred (USD)
-
-        Returns:
-            Reward value
-        """
-        # Sanitize inputs
-        fees = 0.0 if np.isnan(fees) else fees
-        il_delta = 0.0 if np.isnan(il_delta) else il_delta
-        gas = 0.0 if np.isnan(gas) else gas
-        current_price = self.initial_price if (np.isnan(current_price) or current_price <= 0) else current_price
-
-        # === 1. 범위 계산 ===
-        range_center = (self.position_min_price + self.position_max_price) / 2
-        range_half = (self.position_max_price - self.position_min_price) / 2
-        range_pct = 2 * range_half / current_price if current_price > 0 else 0.2
-
-        # Prevent division by zero
-        if range_half <= 0:
-            range_half = current_price * 0.1
-
-        # === 2. 포지션 품질 (Position Quality) ===
-        # 중앙=1.0, 경계=0.0, 이탈=음수
-        in_range = self.position_min_price <= current_price <= self.position_max_price
-
-        if in_range:
-            distance = abs(current_price - range_center) / range_half
-            position_quality = 1.0 - distance  # 1=중앙, 0=경계
-        else:
-            # 이탈 정도에 비례한 패널티
-            if current_price < self.position_min_price:
-                overshoot = (self.position_min_price - current_price) / range_half
-            else:
-                overshoot = (current_price - self.position_max_price) / range_half
-            position_quality = -min(overshoot, 2.0)  # 최대 -2.0
-
-        # === 3. 수수료 집중도 (Concentration) ===
-        # 좁은 범위 = 높은 집중도 = 수수료 보너스
-        # 기준: ±10% (20% 폭) = 1.0
-        concentration = min(4.0, 0.20 / max(range_pct, 0.05))
-        fee_reward = fees * concentration
-
-        # === 4. 경계 리스크 패널티 (Edge Risk) ===
-        # 경계 근접 × 범위 좁음 = 높은 리스크
-        if position_quality > 0:
-            edge_proximity = 1.0 - position_quality  # 0=중앙, 1=경계
-            # 좁은 범위일수록 경계 리스크 증폭 (이탈 시 손실 크므로)
-            risk_penalty = (edge_proximity ** 2) * concentration * 0.03
-        else:
-            # 이탈 상태: 직접적 패널티
-            risk_penalty = abs(position_quality) * 0.3
-
-        # === 5. IL 패널티 (가중치 낮춤) ===
-        # IL delta는 노이즈가 많으므로 가중치를 낮게 유지
-        il_weight = self.reward_weights.get('il_weight', 0.05)
-        il_penalty = abs(il_delta) * il_weight
-
-        # === 6. 포지션 품질 보너스 ===
-        # 좋은 포지션 유지에 대한 직접적 보상
-        quality_bonus = position_quality * 0.05 if position_quality > 0 else 0
-
-        # === 7. 가스 패널티 ===
-        gas_penalty = gas if did_rebalance else 0.0
-
-        # === 최종 보상 ===
-        reward = fee_reward + quality_bonus - risk_penalty - il_penalty - gas_penalty
-
-        # Clip extreme values
-        reward = np.clip(reward, -10.0, 10.0)
-
-        # Replace NaN reward with 0
-        if np.isnan(reward) or np.isinf(reward):
-            reward = 0.0
-
-        return reward
-
     def _calculate_reward_excess_return(self, fees: float, current_price: float,
                                         did_rebalance: bool, gas: float) -> float:
         """
@@ -1678,8 +1484,7 @@ class UniswapV3LPEnv(gym.Env):
         # 수수료: cumulative_fees → lp_value에 이미 반영되어 excess_return에 자동 포함
         # 추가 보너스/패널티 없음 (이중 계산 방지)
 
-        # Clip extreme values
-        reward = np.clip(reward, -50.0, 50.0)
+        # Note: 클리핑 제거 - 실제 excess return을 그대로 반영
 
         # Replace NaN reward with 0
         if np.isnan(reward) or np.isinf(reward):
@@ -1689,35 +1494,66 @@ class UniswapV3LPEnv(gym.Env):
 
     def _calculate_edge_proximity(self, current_price: float) -> float:
         """
-        Calculate how close the current price is to the position boundary.
-
-        Based on IL graph analysis (docs/il_graph.png):
-        - 0.0 = price at center of range (safest)
-        - 0.7 = 70% threshold where IL accelerates (rebalance point)
-        - 1.0 = price at boundary (maximum IL risk)
-
-        Args:
-            current_price: Current market price
+        Calculate maximum edge proximity (for rebalancing decision).
+        Returns how close the price is to ANY boundary.
 
         Returns:
-            Edge proximity (0.0 to 1.0+)
+            0.0 = at center
+            1.0 = at boundary (lower or upper)
+            >1.0 = out of range
         """
-        # No position yet
+        lower = self._calculate_edge_proximity_lower(current_price)
+        upper = self._calculate_edge_proximity_upper(current_price)
+        # Return max deviation from center (0.5)
+        # At center: lower=0.5, upper=0.5 → max(|0.5-0.5|, |0.5-0.5|)*2 = 0
+        # At lower: lower=1.0, upper=0.0 → max(|1-0.5|, |0-0.5|)*2 = 1
+        return max(abs(lower - 0.5), abs(upper - 0.5)) * 2
+
+    def _calculate_edge_proximity_lower(self, current_price: float) -> float:
+        """
+        Calculate proximity to lower boundary.
+
+        Returns:
+            0.0 = at upper boundary
+            0.5 = at center
+            1.0 = at lower boundary
+            >1.0 = below lower boundary (out of range)
+        """
         if self.position_min_price <= 0 or self.position_max_price <= 0:
-            return 1.0  # Force initial position creation
+            return 0.5
 
-        # Calculate center and half-range
-        center = (self.position_min_price + self.position_max_price) / 2
-        half_range = (self.position_max_price - self.position_min_price) / 2
+        range_width = self.position_max_price - self.position_min_price
+        if range_width <= 0:
+            return 0.5
 
-        if half_range <= 0:
-            return 1.0
+        # Distance from upper boundary, normalized
+        distance_from_upper = self.position_max_price - current_price
+        proximity = distance_from_upper / range_width
 
-        # Distance from center as ratio of half-range
-        distance = abs(current_price - center)
-        edge_proximity = distance / half_range
+        return max(0.0, proximity)  # 0 at upper, 1 at lower, >1 below lower
 
-        return edge_proximity  # Can be > 1.0 if out of range
+    def _calculate_edge_proximity_upper(self, current_price: float) -> float:
+        """
+        Calculate proximity to upper boundary.
+
+        Returns:
+            0.0 = at lower boundary
+            0.5 = at center
+            1.0 = at upper boundary
+            >1.0 = above upper boundary (out of range)
+        """
+        if self.position_min_price <= 0 or self.position_max_price <= 0:
+            return 0.5
+
+        range_width = self.position_max_price - self.position_min_price
+        if range_width <= 0:
+            return 0.5
+
+        # Distance from lower boundary, normalized
+        distance_from_lower = current_price - self.position_min_price
+        proximity = distance_from_lower / range_width
+
+        return max(0.0, proximity)  # 0 at lower, 1 at upper, >1 above upper
 
     def _get_hodl_value(self, current_price: float) -> float:
         """현재 가격에서 HODL 포트폴리오 가치 계산"""
@@ -1739,7 +1575,10 @@ class UniswapV3LPEnv(gym.Env):
             LP 포지션 총 가치 (USD)
         """
         if self.liquidity <= 0:
-            return self.initial_investment  # 유동성 없으면 초기 투자금 반환
+            # 유동성 0 = 포지션 없음. 실제 남은 가치 반환 (누적 수수료 - 누적 가스비)
+            # 주의: 포지션이 청산된 경우 current_position_value가 실제 남은 자금
+            remaining_value = self.current_position_value + self.cumulative_fees - self.cumulative_gas
+            return max(0.0, remaining_value)
 
         # 현재 유동성과 가격으로 토큰 수량 계산
         tokens = get_token_amounts(
@@ -1839,20 +1678,20 @@ class UniswapV3LPEnv(gym.Env):
             Total swap cost (USD)
         """
         # Calculate token deltas
-        delta0 = needed_tokens[0] - current_tokens[0]
-        delta1 = needed_tokens[1] - current_tokens[1]
+        # split_tokens returns: (token0_count, token1_usd_value)
+        # For WETH/USDT pool: token0=WETH (count), token1=USDT (USD value)
+        delta0 = needed_tokens[0] - current_tokens[0]  # WETH count change
+        delta1 = needed_tokens[1] - current_tokens[1]  # USDT value change (already USD)
 
-        # Price is already in token1/token0 format (USDC/WETH)
-        price_human = price
+        price_human = price  # USDT per WETH
 
         # Determine which token needs to be swapped
-        # For USDC/WETH pool: token0=USDC, token1=WETH
         if delta0 > 0 and delta1 < 0:
-            # Need more token0 (USDC) → swap token1 (WETH) to token0
-            swap_amount_usd = abs(delta1) * price_human  # WETH * USDC/WETH = USDC
+            # Need more WETH (token0) → sell USDT (token1) to get WETH
+            swap_amount_usd = abs(delta1)  # delta1 is already USD
         elif delta0 < 0 and delta1 > 0:
-            # Need more token1 (WETH) → swap token0 (USDC) to token1
-            swap_amount_usd = abs(delta0)  # USDC amount (already USD)
+            # Need more USDT (token1) → sell WETH (token0) to get USDT
+            swap_amount_usd = abs(delta0) * price_human  # WETH count * price = USD
         else:
             # No swap needed (both increase or both decrease - shouldn't happen)
             return 0.0
@@ -1914,33 +1753,34 @@ class UniswapV3LPEnv(gym.Env):
         # 4. Current liquidity level (normalized)
         f4 = np.log1p(self.backtest_L) / 50 if hasattr(self, 'backtest_L') and self.backtest_L > 0 else 0
 
-        # 5. Exponentially weighted volatility (α=0.05 in paper)
-        # Use pre-calculated volatility from features
-        volatility = current_data.get('volatility_24h', current_price * 0.02)
-        f5 = volatility / current_price if current_price > 0 else 0.02
+        # 5. 7-day volatility (이미 수익률의 표준편차이므로 그대로 사용)
+        # 일반적으로 0.005~0.03 범위 (0.5%~3% daily std)
+        f5 = current_data['volatility_7d']
 
-        # 6. 24-hour moving average (normalized)
-        ma_24 = current_data.get('ma_24h', current_price)
-        f6 = ma_24 / current_price if current_price > 0 else 1.0
+        # 6. 30-day volatility
+        f6 = current_data['volatility_30d']
 
-        # 7. 168-hour (1 week) moving average (normalized)
-        ma_168 = current_data.get('ma_168h', current_price)
-        f7 = ma_168 / current_price if current_price > 0 else 1.0
+        # 7. Price / 7-day MA (>1 = above MA, <1 = below MA)
+        f7 = current_data['price_to_ma7d']
 
-        # 8-11. Technical indicators (use momentum as proxy if not available)
-        # BB (Bollinger Bands) - price relative to bands
-        f8 = current_data.get('bb_position', 0.5)  # 0-1, 0.5 = middle
+        # 8. Price / 30-day MA (>1 = above MA, <1 = below MA)
+        f8 = current_data['price_to_ma30d']
 
-        # ADXR (Average Directional Movement Index Rating) - trend strength
-        f9 = current_data.get('adxr', 25) / 100  # Normalize to 0-1
+        # 9. 7-day momentum (7일 수익률)
+        f9 = current_data['momentum_7d']
 
-        # BOP (Balance of Power)
-        f10 = current_data.get('bop', 0)  # -1 to +1
+        # 10. 30-day momentum (30일 수익률)
+        f10 = current_data['momentum_30d']
 
-        # DX (Directional Movement Index)
-        f11 = current_data.get('dx', 25) / 100  # Normalize to 0-1
+        # 11. Lower edge proximity (하단 경계 근접도)
+        # 0 = 상단, 0.5 = 중앙, 1 = 하단 경계, >1 = 하단 이탈
+        f11 = self._calculate_edge_proximity_lower(current_price)
 
-        obs = np.array([f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11], dtype=np.float32)
+        # 12. Upper edge proximity (상단 경계 근접도)
+        # 0 = 하단, 0.5 = 중앙, 1 = 상단 경계, >1 = 상단 이탈
+        f12 = self._calculate_edge_proximity_upper(current_price)
+
+        obs = np.array([f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12], dtype=np.float32)
 
         # Replace NaN and inf values
         obs = np.nan_to_num(obs, nan=0.0, posinf=10.0, neginf=-10.0)
