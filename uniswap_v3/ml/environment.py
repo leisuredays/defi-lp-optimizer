@@ -909,6 +909,9 @@ class UniswapV3LPEnv(gym.Env):
 
         no_position = self.position_min_price <= 0
 
+        # First step: force rebalancing with model's chosen range
+        first_step = not getattr(self, '_initial_range_set', True)
+
         # Check if bounds changed significantly (>5% difference)
         bounds_changed = (
             abs(lower_pct - getattr(self, 'current_lower_pct', 0)) > 0.05 or
@@ -939,7 +942,8 @@ class UniswapV3LPEnv(gym.Env):
         # 자동 리밸런싱 제거 - 모델이 직접 결정
         need_rebalance = (
             no_position or                          # First position only
-            model_wants_rebalance                   # Model explicitly requests (signal > 0.9)
+            first_step or                           # First step: model chooses initial range
+            model_wants_rebalance                   # Model explicitly requests (signal > 0.5)
         )
 
         if not need_rebalance:
@@ -1009,6 +1013,9 @@ class UniswapV3LPEnv(gym.Env):
 
         # Update backtest-compatible liquidity
         self._update_backtest_L()
+
+        # Mark initial range as set (for first_step logic)
+        self._initial_range_set = True
 
         return True  # Rebalancing occurred
 
