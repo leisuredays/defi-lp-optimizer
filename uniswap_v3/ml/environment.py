@@ -936,11 +936,10 @@ class UniswapV3LPEnv(gym.Env):
         # 모델의 rebalance_signal이 0.5 초과하면 즉시 리밸런싱
         model_wants_rebalance = rebalance_signal > 0.9  # Higher threshold: model must be very confident
 
+        # 자동 리밸런싱 제거 - 모델이 직접 결정
         need_rebalance = (
-            no_position or                          # First position
-            model_wants_rebalance or                # Model explicitly requests rebalancing
-            in_danger_zone or                       # IL acceleration zone (asymmetric)
-            (bounds_changed and in_warning_zone)    # Bounds change near edge
+            no_position or                          # First position only
+            model_wants_rebalance                   # Model explicitly requests (signal > 0.9)
         )
 
         if not need_rebalance:

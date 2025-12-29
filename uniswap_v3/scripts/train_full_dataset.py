@@ -19,7 +19,7 @@ import matplotlib.dates as mdates
 # Configuration
 TRAIN_RATIO = 0.8  # 80% train, 20% test
 TOTAL_TIMESTEPS = 1_000_000
-CHECKPOINT_INTERVAL = 200_000  # Every 200k for 1M training
+CHECKPOINT_INTERVAL = 50_000  # Every 50k for detailed monitoring
 ENT_COEF = 0.01  # Optimal entropy (0.05 was too high, caused non-convergence)
 
 # Learning rate schedule (linear decay)
